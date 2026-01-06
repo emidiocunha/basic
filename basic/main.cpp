@@ -32,7 +32,7 @@
 
 int main(int argc, const char * argv[]) {
     Interpreter interp;
-    std::cout << "GW-BASIC-like interpreter. Use RUN, LIST, EDIT, NEW, CLEAR, CONT, DELETE n, SAVE \"file\", LOAD \"file\".\n";
+    std::cout << "GW-BASIC-like interpreter. Use RUN, LIST, EDIT, NEW, CLEAR, CONT, DELETE n, SAVE \"file\", LOAD \"file\", and QUIT.\n";
 
     // Optional: auto LOAD+RUN a program file passed on the command line.
     // Example: ./basic demo.bas

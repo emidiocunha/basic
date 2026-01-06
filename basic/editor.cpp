@@ -62,6 +62,18 @@ bool peek_input(int ms) {
     return select(STDIN_FILENO + 1, &set, nullptr, nullptr, &tv) > 0;
 }
 
+void get_window_size(int& rows, int& cols) {
+    winsize ws{};
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_row > 0 && ws.ws_col > 0) {
+        rows = (int)ws.ws_row;
+        cols = (int)ws.ws_col;
+        return;
+    }
+    // Fallback
+    rows = 24;
+    cols = 80;
+}
+
 enum class Key { None, Up, Down, Left, Right, Enter, Backspace, Esc, Char };
 
 Key read_key(char& out) {
@@ -102,22 +114,60 @@ void run_editor(Env& env) {
     if (lines.empty()) lines.push_back("");
 
     int row = 0, col = 0;
+    int top = 0; // first visible line index (viewport scroll)
+    int termRows = 24, termCols = 80;
 
     while (true) {
+        get_window_size(termRows, termCols);
+        int visibleRows = std::max(1, termRows); // we use full height; no status bar for now
+
+        // Keep viewport aligned so cursor row stays visible.
+        if (row < top) top = row;
+        if (row >= top + visibleRows) top = row - visibleRows + 1;
+        if (top < 0) top = 0;
+        if (top > (int)lines.size() - 1) top = std::max(0, (int)lines.size() - 1);
+
         clear_screen();
-        for (size_t i = 0; i < lines.size(); ++i) {
-            move_cursor(i + 1, 1);
-            std::cout << lines[i];
+
+        // Draw visible slice [top, top+visibleRows)
+        for (int screenR = 0; screenR < visibleRows; ++screenR) {
+            int i = top + screenR;
+            move_cursor(screenR + 1, 1);
+            if (i >= 0 && i < (int)lines.size()) {
+                // Clip long lines to terminal width
+                if (termCols > 1 && (int)lines[i].size() > termCols - 1) {
+                    std::cout << lines[i].substr(0, (size_t)termCols - 1);
+                } else {
+                    std::cout << lines[i];
+                }
+            }
         }
-        move_cursor(row + 1, col + 1);
+
+        // Clamp cursor column to current line length
+        if (row >= 0 && row < (int)lines.size()) {
+            if (col > (int)lines[row].size()) col = (int)lines[row].size();
+            if (col < 0) col = 0;
+        }
+
+        // Place cursor relative to viewport
+        int cursorScreenRow = (row - top) + 1;
+        if (cursorScreenRow < 1) cursorScreenRow = 1;
+        if (cursorScreenRow > visibleRows) cursorScreenRow = visibleRows;
+        int cursorScreenCol = col + 1;
+        if (cursorScreenCol < 1) cursorScreenCol = 1;
+        if (cursorScreenCol > termCols) cursorScreenCol = termCols;
+        move_cursor(cursorScreenRow, cursorScreenCol);
         std::cout.flush();
 
         char ch = 0;
         Key k = read_key(ch);
 
         if (k == Key::Esc) break;
-        if (k == Key::Up && row > 0) row--;
-        if (k == Key::Down && row + 1 < (int)lines.size()) row++;
+        if (k == Key::Up && row > 0) { row--; }
+        if (k == Key::Down && row + 1 < (int)lines.size()) { row++; }
+        if (row >= 0 && row < (int)lines.size()) {
+            if (col > (int)lines[row].size()) col = (int)lines[row].size();
+        }
         if (k == Key::Left && col > 0) col--;
         if (k == Key::Right && col < (int)lines[row].size()) col++;
 

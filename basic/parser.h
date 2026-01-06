@@ -23,6 +23,7 @@
 #include <limits>
 #include <algorithm>
 #include <filesystem>
+#include <chrono>
 #include "token.h"
 #include "env.h"
 #include "editor.h"
@@ -85,7 +86,7 @@ struct Parser {
     static bool isFunction(const std::string& upper) {
         static const std::unordered_map<std::string, bool> fn = {
             {"SIN",true},{"COS",true},{"TAN",true},{"ATN",true},{"LOG",true},{"EXP",true},{"SQR",true},{"ABS",true},{"INT",true},{"SGN",true},
-            {"RND",true},{"VAL",true},{"STR$",true},{"LEN",true},{"LEFT$",true},{"RIGHT$",true},{"MID$",true},{"CHR$",true},{"ASC",true},{"TAB",true}
+            {"RND",true},{"TIME",true},{"VAL",true},{"STR$",true},{"LEN",true},{"LEFT$",true},{"RIGHT$",true},{"MID$",true},{"CHR$",true},{"ASC",true},{"TAB",true}
         };
         return fn.find(upper) != fn.end();
     }
@@ -129,20 +130,13 @@ struct Parser {
         }
         if (upper == "RND") {
             // GW-BASIC-ish behavior:
-            //  RND(x<0)  : reseed using x and return a new value
-            //  RND(0)    : return the last value (or generate one if none)
-            //  RND(x>0)  : return a new value
+            //   RND()      -> next random number
+            //   RND(x>0)   -> next random number (does NOT reseed)
+            //   RND(0)     -> repeat last random number (or generate if none)
+            //   RND(x<0)   -> reseed using abs(x) and return next random number
+
             double x = args.empty() ? 1.0 : argN(0);
 
-            if (x < 0.0) {
-                long long sx = static_cast<long long>(x);
-                unsigned seed = static_cast<unsigned>(std::llabs(sx));
-                std::srand(seed);
-                double r = static_cast<double>(std::rand()) / (static_cast<double>(RAND_MAX) + 1.0);
-                env.lastRnd = r;
-                env.hasLastRnd = true;
-                return Value(r);
-            }
             if (x == 0.0) {
                 if (!env.hasLastRnd) {
                     double r = static_cast<double>(std::rand()) / (static_cast<double>(RAND_MAX) + 1.0);
@@ -152,10 +146,33 @@ struct Parser {
                 return Value(env.lastRnd);
             }
 
+            if (x < 0.0) {
+                long long sx = static_cast<long long>(x);
+                unsigned seed = static_cast<unsigned>(std::llabs(sx));
+                std::srand(seed);
+                env.hasLastRnd = false;
+            }
+
+            // Generate next value
             double r = static_cast<double>(std::rand()) / (static_cast<double>(RAND_MAX) + 1.0);
             env.lastRnd = r;
             env.hasLastRnd = true;
             return Value(r);
+        }
+
+        if (upper == "TIME") {
+            // TIME(): return current time in seconds since midnight (local time).
+            // This is a numeric analogue to TIME$ in classic BASIC dialects.
+            std::time_t t = std::time(nullptr);
+            std::tm lt{};
+#if defined(_WIN32)
+            localtime_s(&lt, &t);
+#else
+            std::tm* p = std::localtime(&t);
+            if (p) lt = *p;
+#endif
+            double secs = static_cast<double>(lt.tm_hour * 3600 + lt.tm_min * 60 + lt.tm_sec);
+            return Value(secs);
         }
         if (upper == "VAL") return Value(Value(argS(0)).asNumber());
         if (upper == "STR$") return Value(Value(argN(0)).asString());
@@ -279,9 +296,15 @@ struct Parser {
             std::string upper = upperName(name);
             tok = lex.next();
 
+            // Function calls: NAME(args)
             if (tok.kind == TokenKind::LParen && isFunction(upper)) {
                 auto args = parseArgList();
                 return callFunction(upper, std::move(args));
+            }
+
+            // Allow TIME without parentheses (TIME == TIME())
+            if (upper == "TIME") {
+                return callFunction(upper, {});
             }
 
             if (tok.kind == TokenKind::LParen) {
@@ -351,14 +374,110 @@ struct Parser {
     void exec_FOR();
     void exec_NEXT();
     void exec_DIM();
+    void exec_COLOR();
     void exec_LOCATE();
     void exec_RANDOMIZE();
+    void exec_ON();
+    void exec_INTERVAL_CTRL();
+    void exec_DEFINT();
+    void exec_CLEAR();
+    void exec_KEY_CTRL();
+    void exec_DATA();
+    void exec_READ();
+    void exec_RESTORE();
     void jumpToLine(int target);
 
     void markLineProgress() {
         env.posInLine = linePosBase + lex.i;
     }
+    void markStatementStart() {
+        // lexer tracks the start index of the current token; for interrupts we want to
+        // resume *at* the statement keyword, not after it.
+        env.posInLine = linePosBase + lex.tokenStart;
+    }
+
+    // Timer safe-point: fire interval interrupt if needed
+    void maybeFireIntervalInterrupt() {
+        if (!env.intervalArmed || !env.intervalEnabled) return;
+        if (env.intervalSeconds <= 0.0) return;
+        if (env.inIntervalISR) return;
+
+        auto now = std::chrono::steady_clock::now();
+        if (now < env.nextIntervalFire) return;
+
+        // Schedule next fire (avoid drift by stepping forward in multiples)
+        auto period = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+            std::chrono::duration<double>(env.intervalSeconds)
+        );
+        if (period.count() <= 0) return;
+
+        do {
+            env.nextIntervalFire += period;
+        } while (env.nextIntervalFire <= now);
+
+        // Perform a GOSUB-like jump to the handler line.
+        // Save the *statement start* so we re-execute the interrupted statement on RETURN.
+        markStatementStart();
+        env.gosubStack.push_back({env.pc, env.posInLine});
+        env.inIntervalISR = true;
+        jumpToLine(env.intervalGosubLine);
+    }
 };
+
+
+// -------------------- ANSI COLOR helpers --------------------
+
+static inline int basic_ansi_fg_code(int c) {
+    // Map GW-BASIC COLOR codes 0..15 to ANSI SGR foreground codes.
+    // 0-7: normal (30-37), 8-15: bright (90-97)
+    static const int map[16] = {
+        30, // 0 Black
+        34, // 1 Blue
+        32, // 2 Green
+        36, // 3 Cyan
+        31, // 4 Red
+        35, // 5 Magenta
+        33, // 6 Brown (dark yellow)
+        37, // 7 White
+        90, // 8 Gray (bright black)
+        94, // 9 Light Blue
+        92, // 10 Light Green
+        96, // 11 Light Cyan
+        91, // 12 Light Red
+        95, // 13 Light Magenta
+        93, // 14 Yellow (bright yellow)
+        97  // 15 Bright White
+    };
+    if (c < 0) c = 0;
+    if (c > 15) c = 15;
+    return map[c];
+}
+
+static inline int basic_ansi_bg_code(int c) {
+    // Map GW-BASIC COLOR codes 0..15 to ANSI SGR background codes.
+    // 0-7: normal (40-47), 8-15: bright (100-107)
+    static const int map[16] = {
+        40,  // 0 Black
+        44,  // 1 Blue
+        42,  // 2 Green
+        46,  // 3 Cyan
+        41,  // 4 Red
+        45,  // 5 Magenta
+        43,  // 6 Brown (dark yellow)
+        47,  // 7 White
+        100, // 8 Gray
+        104, // 9 Light Blue
+        102, // 10 Light Green
+        106, // 11 Light Cyan
+        101, // 12 Light Red
+        105, // 13 Light Magenta
+        103, // 14 Yellow
+        107  // 15 Bright White
+    };
+    if (c < 0) c = 0;
+    if (c > 15) c = 15;
+    return map[c];
+}
 
 // -------------------- TAB/PRINT helpers (column-aware) --------------------
 
@@ -540,6 +659,8 @@ void Parser::exec_RETURN() {
     env.gosubStack.pop_back();
     env.pc = it;
     env.posInLine = pos;
+    // If we are returning from an INTERVAL interrupt handler, clear ISR flag.
+    env.inIntervalISR = false;
     throw RuntimeError("__JUMP__");
 }
 
@@ -672,6 +793,86 @@ void Parser::exec_DIM() {
     }
 }
 
+void Parser::exec_ON() {
+    // Only implementing: ON INTERVAL <ticks> GOSUB <line>
+    // (MS/GW-BASIC-like, simplified)
+
+    if (tok.kind != TokenKind::KW_INTERVAL) {
+        throw RuntimeError("Unsupported ON event (only ON INTERVAL implemented)");
+    }
+    tok = lex.next();
+
+    // Accept (value in 1/60th-second ticks):
+    //   ON INTERVAL 60 GOSUB 100        ' 1 second
+    //   ON INTERVAL(30) GOSUB 100       ' 0.5 seconds
+    //   ON INTERVAL = 120 GOSUB 100     ' 2 seconds
+
+    // Optional '=' form
+    (void)accept(TokenKind::Equal);
+
+    // Optional parentheses: ON INTERVAL(5)
+    // NOTE: interval value is specified in 1/60th-second units (ticks).
+    double ticks = 0.0;
+    if (accept(TokenKind::LParen)) {
+        Value v = parseExpression();
+        consume(TokenKind::RParen, "')'");
+        ticks = v.asNumber();
+    } else {
+        ticks = parseExpression().asNumber();
+    }
+
+    // Convert ticks (1/60s) -> seconds
+    env.intervalSeconds = ticks / 60.0;
+
+    consume(TokenKind::KW_GOSUB, "GOSUB");
+    if (tok.kind != TokenKind::Number) throw ParseError("Expected line number");
+    env.intervalGosubLine = static_cast<int>(tok.number);
+    tok = lex.next();
+
+    // Arm the interval, but keep enabled state as-is; INTERVAL ON/OFF controls it.
+    env.intervalArmed = true;
+
+    // Initialize schedule so it can fire starting now + period.
+    auto now = std::chrono::steady_clock::now();
+    env.nextIntervalFire = now + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+        std::chrono::duration<double>(std::max(0.0, env.intervalSeconds))
+    );
+}
+
+void Parser::exec_INTERVAL_CTRL() {
+    // INTERVAL ON | INTERVAL OFF | INTERVAL STOP
+    // - ON: enable timer (scheduled based on current intervalSeconds)
+    // - OFF: disable timer (keeps settings)
+    // - STOP: disable and disarm
+
+    if (tok.kind == TokenKind::KW_ON) {
+        tok = lex.next();
+        env.intervalEnabled = true;
+        if (env.intervalArmed && env.intervalSeconds > 0.0) {
+            auto now = std::chrono::steady_clock::now();
+            env.nextIntervalFire = now + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                std::chrono::duration<double>(env.intervalSeconds)
+            );
+        }
+        return;
+    }
+
+    if (tok.kind == TokenKind::KW_OFF) {
+        tok = lex.next();
+        env.intervalEnabled = false;
+        return;
+    }
+
+    if (tok.kind == TokenKind::KW_STOP) {
+        tok = lex.next();
+        env.intervalEnabled = false;
+        env.intervalArmed = false;
+        return;
+    }
+
+    throw RuntimeError("Expected INTERVAL ON/OFF/STOP");
+}
+
 void Parser::execOneStatement() {
     if (tok.kind == TokenKind::End || tok.kind == TokenKind::Colon) return;
 
@@ -682,6 +883,10 @@ void Parser::execOneStatement() {
     }
 
     switch (tok.kind) {
+        case TokenKind::KW_ON:
+            tok = lex.next();
+            exec_ON();
+            return;
         case TokenKind::KW_PRINT:
             tok = lex.next();
             exec_PRINT();
@@ -718,6 +923,14 @@ void Parser::execOneStatement() {
             tok = lex.next();
             exec_DIM();
             return;
+        case TokenKind::KW_COLOR:
+            tok = lex.next();
+            exec_COLOR();
+            return;
+        case TokenKind::KW_INTERVAL:
+            tok = lex.next();
+            exec_INTERVAL_CTRL();
+            return;
         case TokenKind::KW_CLS:
             tok = lex.next();
             // ANSI clear screen + cursor home (macOS Terminal/iTerm/VSCode terminal)
@@ -732,6 +945,18 @@ void Parser::execOneStatement() {
             tok = lex.next();
             exec_RANDOMIZE();
             return;
+        case TokenKind::KW_DEFINT:
+            tok = lex.next();
+            exec_DEFINT();
+            return;
+        case TokenKind::KW_KEY:
+            tok = lex.next();
+            exec_KEY_CTRL();
+            return;
+        case TokenKind::KW_CLEAR:
+            tok = lex.next();
+            exec_CLEAR();
+            return;
         case TokenKind::KW_END:
         case TokenKind::KW_STOP:
             env.running = false;
@@ -741,6 +966,18 @@ void Parser::execOneStatement() {
             return;
         case TokenKind::KW_LET:
             exec_LET_or_ASSIGN();
+            return;
+        case TokenKind::KW_DATA:
+            tok = lex.next();
+            exec_DATA();
+            return;
+        case TokenKind::KW_READ:
+            tok = lex.next();
+            exec_READ();
+            return;
+        case TokenKind::KW_RESTORE:
+            tok = lex.next();
+            exec_RESTORE();
             return;
         default:
             break;
@@ -756,7 +993,14 @@ void Parser::execOneStatement() {
 
 void Parser::parseAndExecLine() {
     while (tok.kind != TokenKind::End) {
+        // Timer safe-point before each statement
+        maybeFireIntervalInterrupt();
+
         execOneStatement();
+
+        // Timer safe-point after each statement
+        maybeFireIntervalInterrupt();
+
         if (tok.kind == TokenKind::Colon) {
             tok = lex.next();
             continue;
@@ -766,26 +1010,79 @@ void Parser::parseAndExecLine() {
 }
 
 void Parser::exec_LOCATE() {
-    // LOCATE row[,col]
+    // LOCATE row[,col[,cursor]]
+    // cursor: 0 = hide cursor, 1 = show cursor (GW-BASIC/MSX-style)
     int row = 1;
     int col = 1;
+    int cursor = -1; // -1 = leave unchanged
 
     // Allow: LOCATE ,10 (missing row)
     if (tok.kind != TokenKind::Comma && tok.kind != TokenKind::End && tok.kind != TokenKind::Colon) {
         row = static_cast<int>(parseExpression().asNumber());
     }
+
     if (accept(TokenKind::Comma)) {
-        if (tok.kind != TokenKind::End && tok.kind != TokenKind::Colon) {
+        // Optional col (can be missing: LOCATE row,)
+        if (tok.kind != TokenKind::Comma && tok.kind != TokenKind::End && tok.kind != TokenKind::Colon) {
             col = static_cast<int>(parseExpression().asNumber());
+        }
+
+        // Optional 3rd parameter: cursor visibility
+        if (accept(TokenKind::Comma)) {
+            if (tok.kind != TokenKind::End && tok.kind != TokenKind::Colon) {
+                cursor = static_cast<int>(parseExpression().asNumber());
+            }
         }
     }
 
     if (row < 1) row = 1;
     if (col < 1) col = 1;
 
+    // Cursor visibility (ANSI): show = CSI ? 25 h, hide = CSI ? 25 l
+    if (cursor == 0) {
+        std::cout << "\033[?25l";
+    } else if (cursor == 1) {
+        std::cout << "\033[?25h";
+    }
+
     // ANSI cursor position is 1-based
     std::cout << "\033[" << row << ";" << col << "H";
     env.printCol = col - 1;
+}
+
+void Parser::exec_COLOR() {
+    // COLOR f,b
+    // f = foreground (0..15), b = background (0..15)
+    // If only one argument is provided, it's the foreground.
+    // If a comma is present, background may follow.
+
+    int fg = -1;
+    int bg = -1;
+
+    // Allow: COLOR ,b (missing foreground)
+    if (tok.kind != TokenKind::Comma && tok.kind != TokenKind::End && tok.kind != TokenKind::Colon) {
+        fg = static_cast<int>(parseExpression().asNumber());
+    }
+
+    if (accept(TokenKind::Comma)) {
+        if (tok.kind != TokenKind::End && tok.kind != TokenKind::Colon) {
+            bg = static_cast<int>(parseExpression().asNumber());
+        }
+    }
+
+    // Apply ANSI SGR sequences
+    if (fg >= 0) {
+        if (fg < 0) fg = 0;
+        if (fg > 15) fg = 15;
+        std::cout << "\033[" << basic_ansi_fg_code(fg) << "m";
+    }
+
+    if (bg >= 0) {
+        if (bg < 0) bg = 0;
+        if (bg > 15) bg = 15;
+        // Set background for subsequent output only (GW-BASIC-style)
+        std::cout << "\033[" << basic_ansi_bg_code(bg) << "m";
+    }
 }
 
 void Parser::exec_RANDOMIZE() {
@@ -802,5 +1099,107 @@ void Parser::exec_RANDOMIZE() {
     unsigned seed = static_cast<unsigned>(static_cast<long long>(v.asNumber()));
     std::srand(seed);
     env.hasLastRnd = false;
+}
+
+void Parser::exec_DEFINT() {
+    // Accept and ignore: DEFINT A-Z, DEFINT A-C, X, M-P, etc.
+
+    auto consume_letter = [&]() {
+        if (tok.kind != TokenKind::Identifier || tok.text.empty())
+            throw ParseError("Expected letter in DEFINT");
+        char ch = (char)std::toupper((unsigned char)tok.text[0]);
+        if (ch < 'A' || ch > 'Z')
+            throw ParseError("Expected A-Z letter in DEFINT");
+        tok = lex.next();
+    };
+
+    while (true) {
+        bool hadParen = accept(TokenKind::LParen);
+
+        consume_letter();
+        if (accept(TokenKind::Minus)) {
+            consume_letter();
+        }
+
+        if (hadParen) consume(TokenKind::RParen, "')'");
+
+        if (accept(TokenKind::Comma)) continue;
+        break;
+    }
+}
+
+void Parser::exec_CLEAR() {
+    // CLEAR [n]
+    // GW-BASIC allows CLEAR to take parameters for memory/string space.
+    // This interpreter doesn't use those memory model tunings, but we accept
+    // an optional numeric argument and ignore it.
+
+    if (tok.kind != TokenKind::End && tok.kind != TokenKind::Colon) {
+        // parse and ignore optional numeric parameter
+        (void)parseExpression();
+    }
+
+    // CLEAR runtime state (variables/arrays/stacks), keep program intact.
+    env.clearVars();
+}
+
+void Parser::exec_KEY_CTRL() {
+    // KEY ON / KEY OFF
+    // GW-BASIC controls function-key macro display/handling. We accept and ignore.
+
+    if (tok.kind == TokenKind::KW_ON) {
+        tok = lex.next();
+        return;
+    }
+    if (tok.kind == TokenKind::KW_OFF) {
+        tok = lex.next();
+        return;
+    }
+
+    throw RuntimeError("Expected KEY ON/OFF");
+}
+
+void Parser::exec_DATA() {
+    // DATA is non-executable: skip to end of statement (or ':' / end)
+    while (tok.kind != TokenKind::End && tok.kind != TokenKind::Colon) {
+        tok = lex.next();
+    }
+}
+
+void Parser::exec_RESTORE() {
+    // RESTORE [line]
+    int line = 0;
+    if (tok.kind == TokenKind::Number) {
+        line = (int)tok.number;
+        tok = lex.next();
+    }
+    env.restoreData(line, env.program);
+}
+
+void Parser::exec_READ() {
+    // READ var[,var...]
+    while (true) {
+        if (tok.kind != TokenKind::Identifier) throw ParseError("Expected variable name");
+        std::string name = tok.text;
+        tok = lex.next();
+
+        bool isArray = false;
+        int idx = 0;
+        if (tok.kind == TokenKind::LParen) {
+            auto args = parseArgList();
+            if (args.size() != 1) throw RuntimeError("Bad subscript");
+            idx = (int)args[0].asNumber();
+            isArray = true;
+        }
+
+        bool wantString = (!name.empty() && name.back() == '$');
+        Value v = env.readNextData(wantString, env.program);
+
+        if (isArray) env.setArrayElem(name, idx, v);
+        else env.setVar(name, v);
+
+        if (accept(TokenKind::Comma)) continue;
+        break;
+    }
 }
 

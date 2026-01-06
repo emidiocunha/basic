@@ -129,6 +129,15 @@ struct Lexer {
             if (auto t = kw("MOD", TokenKind::KW_MOD)) { tokenEnd = i; return *t; }
             if (auto t = kw("CLS", TokenKind::KW_CLS)) { tokenEnd = i; return *t; }
             if (auto t = kw("LOCATE", TokenKind::KW_LOCATE)) { tokenEnd = i; return *t; }
+            if (auto t = kw("COLOR", TokenKind::KW_COLOR)) { tokenEnd = i; return *t; }
+            if (auto t = kw("ON", TokenKind::KW_ON)) { tokenEnd = i; return *t; }
+            if (auto t = kw("INTERVAL", TokenKind::KW_INTERVAL)) { tokenEnd = i; return *t; }
+            if (auto t = kw("OFF", TokenKind::KW_OFF)) { tokenEnd = i; return *t; }
+            if (auto t = kw("DEFINT", TokenKind::KW_DEFINT)) { tokenEnd = i; return *t; }
+            if (auto t = kw("KEY", TokenKind::KW_KEY)) { tokenEnd = i; return *t; }
+            if (auto t = kw("READ", TokenKind::KW_READ)) { tokenEnd = i; return *t; }
+            if (auto t = kw("DATA", TokenKind::KW_DATA)) { tokenEnd = i; return *t; }
+            if (auto t = kw("RESTORE", TokenKind::KW_RESTORE)) { tokenEnd = i; return *t; }
             if (auto t = kw("RANDOMIZE", TokenKind::KW_RANDOMIZE)) { tokenEnd = i; return *t; }
 
             if (auto t = kw("RUN", TokenKind::KW_RUN)) { tokenEnd = i; return *t; }
