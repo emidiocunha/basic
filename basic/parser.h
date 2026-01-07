@@ -126,7 +126,8 @@ struct Parser {
         if (upper == "INT") return Value(std::floor(argN(0)));
         if (upper == "SGN") {
             double x = argN(0);
-            return Value((x > 0) ? 1.0 : ((x < 0) ? -1.0 : 0.0));
+            int16_t r = (x > 0) ? static_cast<int16_t>(1) : ((x < 0) ? static_cast<int16_t>(-1) : static_cast<int16_t>(0));
+            return Value(r);
         }
         if (upper == "RND") {
             // GW-BASIC-ish behavior:
@@ -240,24 +241,63 @@ struct Parser {
 
         if (op == TokenKind::Plus) {
             if (a.isString() || b.isString()) return Value(a.asString() + b.asString());
+            if (a.isInt() && b.isInt()) {
+                int32_t r = static_cast<int32_t>(a.asInt()) + static_cast<int32_t>(b.asInt());
+                return Value(Value::toInt16Checked(static_cast<double>(r)));
+            }
             return Value(a.asNumber() + b.asNumber());
         }
-        if (op == TokenKind::Minus) return Value(a.asNumber() - b.asNumber());
-        if (op == TokenKind::Star) return Value(a.asNumber() * b.asNumber());
-        if (op == TokenKind::Slash) return Value(a.asNumber() / b.asNumber());
+        if (op == TokenKind::Minus) {
+            if (a.isInt() && b.isInt()) {
+                int32_t r = static_cast<int32_t>(a.asInt()) - static_cast<int32_t>(b.asInt());
+                return Value(Value::toInt16Checked(static_cast<double>(r)));
+            }
+            return Value(a.asNumber() - b.asNumber());
+        }
+        if (op == TokenKind::Star) {
+            if (a.isInt() && b.isInt()) {
+                int32_t r = static_cast<int32_t>(a.asInt()) * static_cast<int32_t>(b.asInt());
+                return Value(Value::toInt16Checked(static_cast<double>(r)));
+            }
+            return Value(a.asNumber() * b.asNumber());
+        }
+        if (op == TokenKind::Slash) {
+            return Value(a.asNumber() / b.asNumber());
+        }
         if (op == TokenKind::Backslash) {
-            double denom = b.asNumber();
-            if (denom == 0.0) throw RuntimeError("Division by zero");
-            double q = a.asNumber() / denom;
-            // GW-BASIC-style integer division: truncate toward zero.
+            double denomN = b.asNumber();
+            if (denomN == 0.0) throw RuntimeError("Division by zero");
+
+            // GW-BASIC integer division: truncate toward zero, result is integer.
+            if (a.isInt() && b.isInt()) {
+                int16_t av = a.asInt();
+                int16_t bv = b.asInt();
+                // Special overflow case: -32768 \ -1
+                if (av == static_cast<int16_t>(-32768) && bv == static_cast<int16_t>(-1)) {
+                    throw RuntimeError("Overflow");
+                }
+                int16_t q = static_cast<int16_t>(av / bv);
+                return Value(q);
+            }
+
+            double q = a.asNumber() / denomN;
             double tq = std::trunc(q);
-            return Value(tq);
+            return Value(Value::toInt16Checked(tq));
         }
         if (op == TokenKind::Caret) return Value(std::pow(a.asNumber(), b.asNumber()));
         if (op == TokenKind::KW_MOD) {
+            double denomN = b.asNumber();
+            if (denomN == 0.0) throw RuntimeError("Division by zero");
+
+            if (a.isInt() && b.isInt()) {
+                int16_t av = a.asInt();
+                int16_t bv = b.asInt();
+                int16_t r = static_cast<int16_t>(av % bv);
+                return Value(r);
+            }
+
             double x = a.asNumber();
-            double y = b.asNumber();
-            if (y == 0.0) throw RuntimeError("Division by zero");
+            double y = denomN;
             return Value(std::fmod(x, y));
         }
         if (op == TokenKind::KW_AND) return Value::fromBool((a.asNumber() != 0.0) && (b.asNumber() != 0.0));
@@ -325,6 +365,11 @@ struct Parser {
         if (tok.kind == TokenKind::Minus) {
             tok = lex.next();
             Value v = parsePrimary();
+            if (v.isInt()) {
+                int16_t iv = v.asInt();
+                if (iv == static_cast<int16_t>(-32768)) throw RuntimeError("Overflow");
+                return Value(static_cast<int16_t>(-iv));
+            }
             return Value(-v.asNumber());
         }
         if (tok.kind == TokenKind::KW_NOT) {
@@ -666,13 +711,15 @@ void Parser::exec_RETURN() {
 
 void Parser::exec_IF() {
     Value cond = parseExpression();
-    auto r = lex.i;
-    
     consume(TokenKind::KW_THEN, "THEN");
+    // Remember where the first token after THEN begins.
+    size_t thenStmtStart = lex.tokenStart;
 
     bool truthy = (cond.asNumber() != 0.0);
     if (!truthy) {
-        while (tok.kind != TokenKind::End && tok.kind != TokenKind::Colon) tok = lex.next();
+        // In BASIC, ':' after THEN is still part of the THEN-clause.
+        // If the condition is false, skip the entire remainder of the line.
+        while (tok.kind != TokenKind::End) tok = lex.next();
         return;
     }
 
@@ -682,11 +729,11 @@ void Parser::exec_IF() {
         jumpToLine(target);
     }
 
-    std::string rest = lex.s.substr(r);
+    std::string rest = lex.s.substr(thenStmtStart);
     if (!rest.empty()) {
         Parser p2(rest, env);
         p2.currentLine = currentLine;
-        p2.linePosBase = linePosBase + lex.i;
+        p2.linePosBase = linePosBase + thenStmtStart;
         while (p2.tok.kind != TokenKind::End) {
             p2.execOneStatement();
             if (p2.tok.kind == TokenKind::Colon) {
@@ -726,10 +773,13 @@ void Parser::exec_FOR() {
         resumeIt = it2;
         resumePos = 0;
     } else if (tok.kind == TokenKind::Colon) {
-        tok = lex.next();
-        markLineProgress();
+        // FOR with an inline body on the same line.
+        // IMPORTANT: do NOT consume the ':' here. `parseAndExecLine()` uses ':' as the
+        // statement separator; if we advance past it, the rest of the line won't run.
         resumeIt = env.pc;
-        resumePos = env.posInLine;
+        // Resume after ':' (tokenEnd points to the character just after ':').
+        resumePos = linePosBase + lex.tokenEnd;
+        // Leave tok as ':' so the outer loop can advance and execute the inline body.
     }
 
     Env::ForFrame frame;
@@ -738,6 +788,16 @@ void Parser::exec_FOR() {
     frame.step = step;
     frame.returnIt = resumeIt;
     frame.posInLine = resumePos;
+    
+    // GW-BASIC semantics: remove any existing FOR with same control variable (case-insensitive)
+    const std::string uvar = upperName(var);
+    for (int i = static_cast<int>(env.forStack.size()) - 1; i >= 0; --i) {
+        if (upperName(env.forStack[static_cast<size_t>(i)].var) == uvar) {
+            env.forStack.erase(env.forStack.begin() + i, env.forStack.end());
+            break;
+        }
+    }
+    
     env.forStack.push_back(std::move(frame));
 }
 
@@ -747,19 +807,35 @@ void Parser::exec_NEXT() {
         var = tok.text;
         tok = lex.next();
     }
-
-    if (env.forStack.empty()) throw RuntimeError("NEXT without FOR");
-
-    int idxFrame = static_cast<int>(env.forStack.size()) - 1;
-    if (!var.empty()) {
-        bool found = false;
-        for (int i = idxFrame; i >= 0; --i) {
-            if (env.forStack[static_cast<size_t>(i)].var == var) { idxFrame = i; found = true; break; }
-        }
-        if (!found) throw RuntimeError("NEXT without matching FOR");
+    if (env.forStack.empty()) {
+        throw RuntimeError("NEXT without FOR");
     }
 
-    Env::ForFrame frame = env.forStack[static_cast<size_t>(idxFrame)];
+    int idxFrame = static_cast<int>(env.forStack.size()) - 1;
+
+    // If NEXT specifies a variable, find the most recent FOR for that variable.
+    // BASIC is case-insensitive.
+    if (!var.empty()) {
+        const std::string uvar = upperName(var);
+        bool found = false;
+        for (int i = idxFrame; i >= 0; --i) {
+            if (upperName(env.forStack[static_cast<size_t>(i)].var) == uvar) {
+                idxFrame = i;
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            throw RuntimeError("NEXT without FOR");
+        }
+
+        // Drop any inner FORs above the matched one (GOTO can jump out of inner loops).
+        if (idxFrame + 1 < static_cast<int>(env.forStack.size())) {
+            env.forStack.erase(env.forStack.begin() + (idxFrame + 1), env.forStack.end());
+        }
+    }
+
+    Env::ForFrame &frame = env.forStack.back();
     double cur = env.getVar(frame.var).asNumber();
     cur += frame.step;
     env.setVar(frame.var, Value(cur));
@@ -771,7 +847,7 @@ void Parser::exec_NEXT() {
         throw RuntimeError("__JUMP__");
     }
 
-    env.forStack.erase(env.forStack.begin() + idxFrame, env.forStack.end());
+    env.forStack.pop_back();
 }
 
 void Parser::exec_DIM() {
@@ -1102,26 +1178,31 @@ void Parser::exec_RANDOMIZE() {
 }
 
 void Parser::exec_DEFINT() {
-    // Accept and ignore: DEFINT A-Z, DEFINT A-C, X, M-P, etc.
+    // DEFINT A-Z, DEFINT A-C, X, M-P, etc.
+    // Sets default type to INTEGER (16-bit) for variables starting with given letters.
 
-    auto consume_letter = [&]() {
+    auto read_letter = [&]() -> char {
         if (tok.kind != TokenKind::Identifier || tok.text.empty())
             throw ParseError("Expected letter in DEFINT");
-        char ch = (char)std::toupper((unsigned char)tok.text[0]);
+        char ch = static_cast<char>(std::toupper(static_cast<unsigned char>(tok.text[0])));
         if (ch < 'A' || ch > 'Z')
             throw ParseError("Expected A-Z letter in DEFINT");
         tok = lex.next();
+        return ch;
     };
 
     while (true) {
         bool hadParen = accept(TokenKind::LParen);
 
-        consume_letter();
+        char a = read_letter();
+        char b = a;
         if (accept(TokenKind::Minus)) {
-            consume_letter();
+            b = read_letter();
         }
 
         if (hadParen) consume(TokenKind::RParen, "')'");
+
+        env.setDefIntRange(a, b, true);
 
         if (accept(TokenKind::Comma)) continue;
         break;
@@ -1139,8 +1220,18 @@ void Parser::exec_CLEAR() {
         (void)parseExpression();
     }
 
-    // CLEAR runtime state (variables/arrays/stacks), keep program intact.
+    // CLEAR runtime state (variables/arrays), keep program intact.
+    // Many GW-BASIC programs use CLEAR n as a memory-tuning hint; they don't expect it
+    // to break active control flow. Preserve FOR/GOSUB stacks.
+    auto savedFor = env.forStack;
+    auto savedGosub = env.gosubStack;
+    bool savedInISR = env.inIntervalISR;
+
     env.clearVars();
+
+    env.forStack = std::move(savedFor);
+    env.gosubStack = std::move(savedGosub);
+    env.inIntervalISR = savedInISR;
 }
 
 void Parser::exec_KEY_CTRL() {

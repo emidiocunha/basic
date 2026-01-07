@@ -10,6 +10,7 @@
 #include <unordered_map>
 #include <vector>
 #include <variant>
+#include <cstdint>
 #include <string>
 #include <sstream>
 #include <stdexcept>
@@ -18,6 +19,7 @@
 #include <cctype>
 #include <cstring>
 #include <ctime>
+#include <cmath>
 
 struct Parser;
 
@@ -30,18 +32,22 @@ struct ParseError : public std::runtime_error {
 };
 
 struct Value {
-    // BASIC has numeric and string types; we keep double and std::string
-    std::variant<double, std::string> data;
+    // BASIC values: integer (16-bit), double, string.
+    std::variant<int16_t, double, std::string> data;
 
     Value() : data(0.0) {}
     explicit Value(double d) : data(d) {}
+    explicit Value(int16_t i) : data(i) {}
     explicit Value(const std::string& s) : data(s) {}
 
     bool isString() const { return std::holds_alternative<std::string>(data); }
-    bool isNumber() const { return std::holds_alternative<double>(data); }
+    bool isInt() const { return std::holds_alternative<int16_t>(data); }
+    bool isDouble() const { return std::holds_alternative<double>(data); }
+    bool isNumber() const { return isInt() || isDouble(); }
 
     double asNumber() const {
-        if (isNumber()) return std::get<double>(data);
+        if (isDouble()) return std::get<double>(data);
+        if (isInt()) return static_cast<double>(std::get<int16_t>(data));
         // string-to-number: GW-BASIC tries to convert leading numeric
         const std::string& s = std::get<std::string>(data);
         char* end = nullptr;
@@ -50,18 +56,33 @@ struct Value {
         return v;
     }
 
+    static int16_t toInt16Checked(double x) {
+        // GW/QBASIC-style integer range check
+        double t = std::trunc(x);
+        if (t < -32768.0 || t > 32767.0) throw RuntimeError("Overflow");
+        return static_cast<int16_t>(static_cast<int>(t));
+    }
+
+    int16_t asInt() const {
+        if (isInt()) return std::get<int16_t>(data);
+        if (isDouble()) return toInt16Checked(std::get<double>(data));
+        return toInt16Checked(asNumber());
+    }
+
     const std::string& asString() const {
         if (isString()) return std::get<std::string>(data);
-        // number to string
         static thread_local std::string temp;
         std::ostringstream oss;
-        oss.setf(std::ios::fmtflags(0), std::ios::floatfield);
-        oss << std::get<double>(data);
+        if (isInt()) oss << static_cast<int>(std::get<int16_t>(data));
+        else {
+            oss.setf(std::ios::fmtflags(0), std::ios::floatfield);
+            oss << std::get<double>(data);
+        }
         temp = oss.str();
         return temp;
     }
 
-    static Value fromBool(bool b) { return Value(b ? 1.0 : 0.0); }
+    static Value fromBool(bool b) { return Value(static_cast<int16_t>(b ? 1 : 0)); }
 };
 
 struct Env {
@@ -112,21 +133,74 @@ struct Env {
     // Console print state (for TAB/PRINT column alignment)
     int printCol = 0; // 0-based column index on the current line
 
+    // DEFINT: when true for a starting letter, numeric variables default to 16-bit integer.
+    // Indexed 0..25 for 'A'..'Z'
+    bool defInt[26] = {false};
+
+    enum class VarType { Double, Int16, String };
+
+    bool defIntForName(const std::string& name) const {
+        if (name.empty()) return false;
+        char c = static_cast<char>(std::toupper(static_cast<unsigned char>(name[0])));
+        if (c < 'A' || c > 'Z') return false;
+        return defInt[c - 'A'];
+    }
+
+    VarType varTypeForName(const std::string& name) const {
+        if (!name.empty()) {
+            char last = name.back();
+            if (last == '$') return VarType::String;
+            if (last == '%') return VarType::Int16;
+        }
+        if (defIntForName(name)) return VarType::Int16;
+        return VarType::Double;
+    }
+
+    void setDefIntRange(char a, char b, bool on = true) {
+        a = static_cast<char>(std::toupper(static_cast<unsigned char>(a)));
+        b = static_cast<char>(std::toupper(static_cast<unsigned char>(b)));
+        if (a < 'A') a = 'A';
+        if (b > 'Z') b = 'Z';
+        if (a > b) std::swap(a, b);
+        for (char c = a; c <= b; ++c) defInt[c - 'A'] = on;
+    }
+
+    void clearDefInt() {
+        for (bool &v : defInt) v = false;
+    }
+
     // Random state for RND/RANDOMIZE behavior
     double lastRnd = 0.0;
     bool hasLastRnd = false;
 
     // Arrays: 1-D only (GW-BASIC style), indexed 0..N
     struct Array {
-        bool isString = false;
+        VarType type = VarType::Double;
         std::vector<Value> elems; // size N+1
     };
     std::unordered_map<std::string, Array> arrays;
 
     void clearVars() {
-        // CLEAR/CLEAR-like: reset runtime state but keep the loaded program.
+        // CLEAR/CLEAR-like: reset variables/arrays but keep program + control-flow intact.
+        // Many GW-BASIC programs use CLEAR n as a memory-tuning hint and do not expect
+        // it to break active FOR/NEXT or GOSUB/RETURN state.
         vars.clear();
         arrays.clear();
+
+        // DATA/READ state
+        dataCacheBuilt = false;
+        dataCache.clear();
+        dataPtr = 0;
+
+        // Keep FOR/GOSUB stacks, interval state, and execution cursor as-is.
+    }
+
+    void clearProgramAndState() {
+        // NEW: clear the stored program and reset runtime state.
+        program.clear();
+        clearDefInt();
+
+        // Control-flow stacks
         forStack.clear();
         gosubStack.clear();
 
@@ -150,39 +224,41 @@ struct Env {
         lastRnd = 0.0;
         hasLastRnd = false;
 
-        // Execution cursor (safe defaults; actual RUN sets these)
-        posInLine = 0;
-        stopped = false;
-        contAvailable = false;
-    }
+        // Variables and arrays
+        vars.clear();
+        arrays.clear();
 
-    void clearProgramAndState() {
-        // NEW: clear the stored program and reset runtime state.
-        program.clear();
         pc = program.end();
         running = false;
         stopped = false;
         contAvailable = false;
         posInLine = 0;
-        clearVars();
+        // Do not call clearVars() here; already cleared above.
     }
 
     Value getVar(const std::string& name) {
         auto it = vars.find(name);
         if (it != vars.end()) return it->second;
-        // default initialization
-        if (!name.empty() && name.back() == '$') return Value(std::string(""));
+
+        switch (varTypeForName(name)) {
+            case VarType::String: return Value(std::string(""));
+            case VarType::Int16:  return Value(static_cast<int16_t>(0));
+            case VarType::Double: return Value(0.0);
+        }
         return Value(0.0);
     }
 
     void setVar(const std::string& name, const Value& v) {
-        // Type rules: $ variables must be string; others numeric
-        if (!name.empty() && name.back() == '$') {
-            if (!v.isString()) vars[name] = Value(v.asString());
-            else vars[name] = v;
-        } else {
-            if (!v.isNumber()) vars[name] = Value(v.asNumber());
-            else vars[name] = v;
+        switch (varTypeForName(name)) {
+            case VarType::String:
+                vars[name] = v.isString() ? v : Value(v.asString());
+                return;
+            case VarType::Int16:
+                vars[name] = Value(v.asInt());
+                return;
+            case VarType::Double:
+                vars[name] = Value(v.asNumber());
+                return;
         }
     }
 
@@ -195,9 +271,11 @@ struct Env {
         }
 
         Array a;
-        a.isString = (!name.empty() && name.back() == '$');
-        a.elems.assign(static_cast<size_t>(upperBound) + 1,
-                       a.isString ? Value(std::string("")) : Value(0.0));
+        a.type = varTypeForName(name);
+        Value init = (a.type == VarType::String) ? Value(std::string(""))
+                    : (a.type == VarType::Int16) ? Value(static_cast<int16_t>(0))
+                    : Value(0.0);
+        a.elems.assign(static_cast<size_t>(upperBound) + 1, init);
         arrays.emplace(name, std::move(a));
     }
 
@@ -205,8 +283,11 @@ struct Env {
         // Implicit dimensioning: if referenced before DIM, create 0..10
         if (arrays.find(name) != arrays.end()) return;
         Array a;
-        a.isString = (!name.empty() && name.back() == '$');
-        a.elems.assign(11, a.isString ? Value(std::string("")) : Value(0.0));
+        a.type = varTypeForName(name);
+        Value init = (a.type == VarType::String) ? Value(std::string(""))
+                    : (a.type == VarType::Int16) ? Value(static_cast<int16_t>(0))
+                    : Value(0.0);
+        a.elems.assign(11, init);
         arrays.emplace(name, std::move(a));
     }
 
@@ -226,10 +307,16 @@ struct Env {
         if (it == arrays.end()) throw RuntimeError("Subscripted variable not DIMensioned");
         if (static_cast<size_t>(idx) >= it->second.elems.size()) throw RuntimeError("Subscript out of range");
 
-        if (!name.empty() && name.back() == '$') {
-            it->second.elems[static_cast<size_t>(idx)] = v.isString() ? v : Value(v.asString());
-        } else {
-            it->second.elems[static_cast<size_t>(idx)] = v.isNumber() ? v : Value(v.asNumber());
+        switch (it->second.type) {
+            case VarType::String:
+                it->second.elems[static_cast<size_t>(idx)] = v.isString() ? v : Value(v.asString());
+                break;
+            case VarType::Int16:
+                it->second.elems[static_cast<size_t>(idx)] = Value(v.asInt());
+                break;
+            case VarType::Double:
+                it->second.elems[static_cast<size_t>(idx)] = Value(v.asNumber());
+                break;
         }
     }
     

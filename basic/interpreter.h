@@ -195,6 +195,7 @@ struct Interpreter {
 
     void runFromStart() {
         g_sigint_requested.store(false, std::memory_order_relaxed);
+        env.clearVars();
         env.running = true;
         env.stopped = false;
         env.pc = env.program.begin();
