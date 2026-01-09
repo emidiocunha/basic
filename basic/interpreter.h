@@ -13,6 +13,8 @@
 #include <csignal>
 #include <termios.h>
 #include <unistd.h>
+#include <sys/ioctl.h>
+#include <deque>
 
 static std::string normalize_keywords_upper_preserve(const std::string& line) {
     Lexer lx(line);
@@ -80,9 +82,14 @@ struct ScopedRawInput {
 
 // -------------------- Ctrl+C (SIGINT) handling --------------------
 static std::atomic<bool> g_sigint_requested{false};
+static std::atomic<bool> g_sigwinch_requested{false};
 
 static void basic_sigint_handler(int) {
     g_sigint_requested.store(true, std::memory_order_relaxed);
+}
+
+static void basic_sigwinch_handler(int) {
+    g_sigwinch_requested.store(true, std::memory_order_relaxed);
 }
 
 static inline void install_basic_sigint_handler_once() {
@@ -90,11 +97,24 @@ static inline void install_basic_sigint_handler_once() {
     if (installed) return;
     installed = true;
     std::signal(SIGINT, basic_sigint_handler);
+    std::signal(SIGWINCH, basic_sigwinch_handler);
+}
+
+static inline void basic_update_terminal_size(int &cols, int &rows) {
+    if (!isatty(STDOUT_FILENO)) return;
+    winsize ws{};
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0) {
+        if (ws.ws_col > 0) cols = static_cast<int>(ws.ws_col);
+        if (ws.ws_row > 0) rows = static_cast<int>(ws.ws_row);
+    }
 }
 
 struct Interpreter {
+    int termCols = 80;
+    int termRows = 24;
     Interpreter() {
         install_basic_sigint_handler_once();
+        basic_update_terminal_size(termCols, termRows);
     }
 
     void resetAfterProgramEdit() {
@@ -174,8 +194,81 @@ struct Interpreter {
     }
     Env env;
 
-    void cmd_LIST() {
-        for (auto& [ln, text] : env.program) std::cout << ln << " " << text << "\n";
+    void cmd_LIST(const std::string& args = "") {
+        // LIST
+        // Supported forms:
+        //   LIST          -> all
+        //   LIST X        -> only line X
+        //   LIST X-       -> from X to end
+        //   LIST -Y       -> from start to Y
+        //   LIST X-Y      -> from X to Y
+        std::string a = trim(args);
+        bool hasDash = (a.find('-') != std::string::npos);
+
+        auto parseInt = [](const std::string& s, int& out) -> bool {
+            std::string t = trim(s);
+            if (t.empty()) return false;
+            // allow leading +
+            size_t i = 0;
+            if (t[0] == '+') i = 1;
+            if (i >= t.size()) return false;
+            for (size_t j = i; j < t.size(); ++j) {
+                if (!std::isdigit(static_cast<unsigned char>(t[j]))) return false;
+            }
+            try {
+                out = std::stoi(t);
+            } catch (...) {
+                return false;
+            }
+            return out > 0;
+        };
+
+        int start = 0;
+        int end = 0;
+        bool hasStart = false;
+        bool hasEnd = false;
+
+        if (a.empty()) {
+            // no range
+        } else if (!hasDash) {
+            // LIST X
+            int x = 0;
+            if (!parseInt(a, x)) {
+                std::cout << "LIST: bad line number\n";
+                return;
+            }
+            start = x;
+            end = x;
+            hasStart = true;
+            hasEnd = true;
+        } else {
+            // LIST X-Y / -Y / X-
+            size_t dash = a.find('-');
+            std::string left = a.substr(0, dash);
+            std::string right = a.substr(dash + 1);
+
+            int x = 0;
+            int y = 0;
+            if (parseInt(left, x)) {
+                start = x;
+                hasStart = true;
+            }
+            if (parseInt(right, y)) {
+                end = y;
+                hasEnd = true;
+            }
+            if (!hasStart && !hasEnd) {
+                std::cout << "LIST: bad range\n";
+                return;
+            }
+        }
+
+        auto it = hasStart ? env.program.lower_bound(start) : env.program.begin();
+        for (; it != env.program.end(); ++it) {
+            int ln = it->first;
+            if (hasEnd && ln > end) break;
+            std::cout << ln << " " << it->second << "\n";
+        }
     }
 
     void cmd_NEW() {
@@ -202,6 +295,7 @@ struct Interpreter {
         env.posInLine = 0;
         env.dataCacheBuilt = false;   // or env.rebuildDataCache(env.program);
         env.restoreData(0, env.program);
+        basic_reset_run_event_control(env);
         execute();
     }
 
@@ -225,6 +319,9 @@ struct Interpreter {
                 env.stopped = false;
                 env.contAvailable = true;
                 return;
+            }
+            if (g_sigwinch_requested.exchange(false, std::memory_order_relaxed)) {
+                basic_update_terminal_size(termCols, termRows);
             }
 
             if (env.pc == env.program.end()) {
@@ -281,7 +378,10 @@ struct Interpreter {
 
     void repl() {
         std::string line;
-        std::string lastCommand; // history: only last command
+        std::deque<std::string> history; // command history (max 64)
+        std::string historyDraft;        // what user was typing before history navigation
+        int historyIndex = -1;           // index into history while navigating
+        bool historyNav = false;         // currently navigating history
         ScopedRawInput raw; // disable terminal echo when possible
         while (true) {
             std::cout << "OK> ";
@@ -303,6 +403,14 @@ struct Interpreter {
                     int ch = std::cin.get();
                     if (ch == EOF) break;
 
+                    // Window resize
+                    if (g_sigwinch_requested.exchange(false, std::memory_order_relaxed)) {
+                        basic_update_terminal_size(termCols, termRows);
+                        // Repaint the prompt + current input on a fresh line.
+                        std::cout << "\nOK> " << line << std::flush;
+                        continue;
+                    }
+
                     // Ctrl+C
                     if (g_sigint_requested.exchange(false, std::memory_order_relaxed)) {
                         std::cout << "\nBreak\n";
@@ -313,11 +421,13 @@ struct Interpreter {
                     // Enter
                     if (ch == '\n' || ch == '\r') {
                         std::cout << '\n';
+                        if (historyNav) { historyNav = false; historyIndex = -1; }
                         break;
                     }
 
                     // Backspace
                     if (ch == 127 || ch == '\b') {
+                        if (historyNav) { historyNav = false; historyIndex = -1; }
                         if (!line.empty()) {
                             line.pop_back();
                             std::cout << "\b \b";
@@ -325,26 +435,119 @@ struct Interpreter {
                         continue;
                     }
 
-                    // Escape sequence (arrows)
+                    // Escape sequences (arrows / function keys)
                     if (ch == 27) { // ESC
                         int next = std::cin.get();
-                        if (next == '[' || next == 'O') {
+                        if (next == '[') {
+                            int code = std::cin.get();
+
+                            // Arrow keys: ESC [ A/B/C/D
+                            if (code == 'A') { // UP arrow
+                                if (!history.empty()) {
+                                    if (!historyNav) {
+                                        historyNav = true;
+                                        historyDraft = line; // save what the user was typing
+                                        historyIndex = static_cast<int>(history.size()) - 1;
+                                    } else if (historyIndex > 0) {
+                                        historyIndex--;
+                                    }
+
+                                    // clear current input
+                                    while (!line.empty()) {
+                                        std::cout << "\b \b";
+                                        line.pop_back();
+                                    }
+
+                                    line = history[static_cast<size_t>(historyIndex)];
+                                    std::cout << line;
+                                }
+                                continue;
+                            }
+
+                            if (code == 'B') { // DOWN arrow
+                                if (historyNav) {
+                                    if (historyIndex < static_cast<int>(history.size()) - 1) {
+                                        historyIndex++;
+
+                                        // clear current input
+                                        while (!line.empty()) {
+                                            std::cout << "\b \b";
+                                            line.pop_back();
+                                        }
+
+                                        line = history[static_cast<size_t>(historyIndex)];
+                                        std::cout << line;
+                                    } else {
+                                        // Past the newest entry -> restore draft (often empty)
+                                        historyNav = false;
+                                        historyIndex = -1;
+
+                                        // clear current input
+                                        while (!line.empty()) {
+                                            std::cout << "\b \b";
+                                            line.pop_back();
+                                        }
+
+                                        line = historyDraft;
+                                        std::cout << line;
+                                    }
+                                }
+                                continue;
+                            }
+
+                            // Function keys often arrive as ESC [ <digits> ~ (e.g. F5 = 15~)
+                            if (std::isdigit(static_cast<unsigned char>(code))) {
+                                std::string digits;
+                                digits.push_back(static_cast<char>(code));
+                                while (true) {
+                                    int c2 = std::cin.get();
+                                    if (c2 == EOF) break;
+                                    if (c2 == '~') break;
+                                    if (std::isdigit(static_cast<unsigned char>(c2))) {
+                                        digits.push_back(static_cast<char>(c2));
+                                        continue;
+                                    }
+                                    // Unknown/unsupported sequence; stop.
+                                    break;
+                                }
+
+                                // F5 is commonly ESC [ 15 ~ in Terminal.app / xterm.
+                                if (digits == "15") {
+                                    std::cout << "\n";
+                                    // Discard any partially typed command
+                                    line.clear();
+                                    // Execute RUN
+                                    runFromStart();
+                                }
+                                continue;
+                            }
+
+                            continue;
+                        }
+
+                        if (next == 'O') {
+                            // Some terminals use ESC O ... for special keys (keep UP support just in case)
                             int code = std::cin.get();
                             if (code == 'A') { // UP arrow
-                                // clear current input
-                                while (!line.empty()) {
-                                    std::cout << "\b \b";
-                                    line.pop_back();
+                                // (legacy support, just clear and recall last history entry)
+                                if (!history.empty()) {
+                                    // clear current input
+                                    while (!line.empty()) {
+                                        std::cout << "\b \b";
+                                        line.pop_back();
+                                    }
+                                    line = history.back();
+                                    std::cout << line;
                                 }
-                                // recall last command
-                                line = lastCommand;
-                                std::cout << line;
                             }
+                            continue;
                         }
+
                         continue;
                     }
 
                     // Regular character
+                    if (historyNav) { historyNav = false; historyIndex = -1; }
                     line.push_back((char)ch);
                     std::cout << (char)ch;
                 }
@@ -352,7 +555,15 @@ struct Interpreter {
 
             std::string t = trim(line);
             if (t.empty()) continue;
-            lastCommand = t;
+
+            // Record history (max 64). Avoid duplicating consecutive identical commands.
+            if (history.empty() || history.back() != t) {
+                history.push_back(t);
+                if (history.size() > 64) history.pop_front();
+            }
+            // reset navigation state
+            historyNav = false;
+            historyIndex = -1;
 
             if (std::isdigit(static_cast<unsigned char>(t[0]))) {
                 std::istringstream iss(t);
@@ -374,7 +585,11 @@ struct Interpreter {
             for (char c : t) upper.push_back(std::toupper(static_cast<unsigned char>(c)));
 
             if (upper == "RUN") { runFromStart(); continue; }
-            if (upper == "LIST") { cmd_LIST(); continue; }
+            if (istartswith(upper, "LIST")) {
+                std::string rest = trim(t.substr(4));
+                cmd_LIST(rest);
+                continue;
+            }
             if (upper == "NEW") { cmd_NEW(); continue; }
             if (upper == "CLEAR") { cmd_CLEAR(); continue; }
             if (upper == "CONT") { cont(); continue; }
@@ -409,8 +624,34 @@ struct Interpreter {
                     std::cout << "LOAD requires a filename in quotes\n";
                     continue;
                 }
+
                 std::string fn = rest.substr(1, endq - 1);
+
+                // Optional flags after filename: e.g. LOAD "file.bas",R
+                bool runAfterLoad = false;
+                std::string tail = trim(rest.substr(endq + 1));
+                if (!tail.empty()) {
+                    if (tail[0] != ',') {
+                        std::cout << "LOAD: unexpected text after filename\n";
+                        continue;
+                    }
+                    tail = trim(tail.substr(1));
+                    std::string tailUpper;
+                    tailUpper.reserve(tail.size());
+                    for (char c : tail) tailUpper.push_back(std::toupper(static_cast<unsigned char>(c)));
+
+                    if (tailUpper == "R") {
+                        runAfterLoad = true;
+                    } else {
+                        std::cout << "LOAD: unknown option '" << tail << "'\n";
+                        continue;
+                    }
+                }
+
                 cmd_LOAD(fn);
+                if (runAfterLoad) {
+                    runFromStart();
+                }
                 continue;
             }
             if (istartswith(upper, "DELETE")) {

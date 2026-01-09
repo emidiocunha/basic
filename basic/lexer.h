@@ -139,7 +139,7 @@ struct Lexer {
             if (auto t = kw("DATA", TokenKind::KW_DATA)) { tokenEnd = i; return *t; }
             if (auto t = kw("RESTORE", TokenKind::KW_RESTORE)) { tokenEnd = i; return *t; }
             if (auto t = kw("RANDOMIZE", TokenKind::KW_RANDOMIZE)) { tokenEnd = i; return *t; }
-
+            if (auto t = kw("BEEP", TokenKind::KW_BEEP)) { tokenEnd = i; return *t; }
             if (auto t = kw("RUN", TokenKind::KW_RUN)) { tokenEnd = i; return *t; }
             if (auto t = kw("LIST", TokenKind::KW_LIST)) { tokenEnd = i; return *t; }
             if (auto t = kw("NEW", TokenKind::KW_NEW)) { tokenEnd = i; return *t; }

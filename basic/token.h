@@ -36,6 +36,7 @@ enum class TokenKind {
     KW_READ,
     KW_DATA,
     KW_RESTORE,
+    KW_BEEP,
     // commands (immediate)
     KW_RUN, KW_LIST, KW_NEW, KW_CLEAR, KW_DELETE, KW_CONT, KW_SAVE, KW_LOAD
 };
@@ -64,6 +65,7 @@ static inline bool is_basic_keyword(TokenKind k) {
         case TokenKind::KW_RANDOMIZE:
         case TokenKind::KW_DEFINT:
         case TokenKind::KW_TIME:
+        case TokenKind::KW_BEEP:
         case TokenKind::KW_RUN: case TokenKind::KW_LIST: case TokenKind::KW_NEW:
         case TokenKind::KW_CLEAR: case TokenKind::KW_DELETE: case TokenKind::KW_CONT:
         case TokenKind::KW_SAVE: case TokenKind::KW_LOAD:

@@ -102,8 +102,14 @@ struct Env {
     };
     std::vector<ForFrame> forStack;
 
-    // Gosub stack
-    std::vector<std::pair<std::map<int, std::string>::iterator, size_t>> gosubStack;
+    // Gosub/Return stack
+    struct GosubFrame {
+        std::map<int, std::string>::iterator it;
+        size_t pos;
+        bool isInterval = false; // true only for ON INTERVAL interrupt returns
+        size_t savedDataPtr = 0; // snapshot of DATA pointer for interval ISR
+    };
+    std::vector<GosubFrame> gosubStack;
 
     // Execution state
     std::map<int, std::string>::iterator pc;

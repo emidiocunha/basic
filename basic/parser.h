@@ -422,6 +422,7 @@ struct Parser {
     void exec_COLOR();
     void exec_LOCATE();
     void exec_RANDOMIZE();
+    void exec_BEEP();
     void exec_ON();
     void exec_INTERVAL_CTRL();
     void exec_DEFINT();
@@ -433,7 +434,13 @@ struct Parser {
     void jumpToLine(int target);
 
     void markLineProgress() {
-        env.posInLine = linePosBase + lex.i;
+        // Save progress at a safe resume point (between statements).
+        // Skip any whitespace so resuming doesn't start at an ambiguous position.
+        size_t p = linePosBase + lex.i;
+        while (p < currentLine.size() && std::isspace(static_cast<unsigned char>(currentLine[p]))) {
+            ++p;
+        }
+        env.posInLine = p;
     }
     void markStatementStart() {
         // lexer tracks the start index of the current token; for interrupts we want to
@@ -443,27 +450,25 @@ struct Parser {
 
     // Timer safe-point: fire interval interrupt if needed
     void maybeFireIntervalInterrupt() {
-        if (!env.intervalArmed || !env.intervalEnabled) return;
-        if (env.intervalSeconds <= 0.0) return;
+        if (!env.intervalEnabled) return;
+        if (!env.intervalArmed) return;
         if (env.inIntervalISR) return;
+        if (env.intervalSeconds <= 0.0) return;
+        if (env.intervalGosubLine <= 0) return;
 
         auto now = std::chrono::steady_clock::now();
         if (now < env.nextIntervalFire) return;
 
-        // Schedule next fire (avoid drift by stepping forward in multiples)
-        auto period = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
-            std::chrono::duration<double>(env.intervalSeconds)
+        // Schedule next fire before jumping.
+        env.nextIntervalFire = now + std::chrono::milliseconds(
+            static_cast<int>(env.intervalSeconds * 1000.0)
         );
-        if (period.count() <= 0) return;
 
-        do {
-            env.nextIntervalFire += period;
-        } while (env.nextIntervalFire <= now);
+        // Fire ONLY between lines: resume at the start of the NEXT line after RETURN.
+        auto retIt = env.pc;
+        if (retIt != env.program.end()) ++retIt;
 
-        // Perform a GOSUB-like jump to the handler line.
-        // Save the *statement start* so we re-execute the interrupted statement on RETURN.
-        markStatementStart();
-        env.gosubStack.push_back({env.pc, env.posInLine});
+        env.gosubStack.push_back({retIt, 0, true, env.dataPtr});
         env.inIntervalISR = true;
         jumpToLine(env.intervalGosubLine);
     }
@@ -692,7 +697,7 @@ void Parser::exec_GOTO(bool isGosub) {
 
     if (isGosub) {
         markLineProgress();
-        env.gosubStack.push_back({env.pc, env.posInLine});
+        env.gosubStack.push_back({env.pc, env.posInLine, false, 0});
     }
 
     jumpToLine(target);
@@ -700,12 +705,20 @@ void Parser::exec_GOTO(bool isGosub) {
 
 void Parser::exec_RETURN() {
     if (env.gosubStack.empty()) throw RuntimeError("RETURN without GOSUB");
-    auto [it, pos] = env.gosubStack.back();
+
+    Env::GosubFrame fr = env.gosubStack.back();
     env.gosubStack.pop_back();
-    env.pc = it;
-    env.posInLine = pos;
-    // If we are returning from an INTERVAL interrupt handler, clear ISR flag.
-    env.inIntervalISR = false;
+
+    env.pc = fr.it;
+    env.posInLine = fr.pos;
+
+    // Clear ISR flag only when returning from the ON INTERVAL handler frame.
+    if (fr.isInterval) {
+        // Restore DATA/READ position to what it was when the interval interrupted.
+        env.dataPtr = fr.savedDataPtr;
+        env.inIntervalISR = false;
+    }
+
     throw RuntimeError("__JUMP__");
 }
 
@@ -1003,6 +1016,10 @@ void Parser::execOneStatement() {
             tok = lex.next();
             exec_COLOR();
             return;
+        case TokenKind::KW_BEEP:
+            tok = lex.next();
+            exec_BEEP();
+            return;
         case TokenKind::KW_INTERVAL:
             tok = lex.next();
             exec_INTERVAL_CTRL();
@@ -1069,20 +1086,15 @@ void Parser::execOneStatement() {
 
 void Parser::parseAndExecLine() {
     while (tok.kind != TokenKind::End) {
-        // Timer safe-point before each statement
-        maybeFireIntervalInterrupt();
-
         execOneStatement();
-
-        // Timer safe-point after each statement
-        maybeFireIntervalInterrupt();
-
         if (tok.kind == TokenKind::Colon) {
             tok = lex.next();
             continue;
         }
         break;
     }
+    // Timer safe-point after each statement
+    maybeFireIntervalInterrupt();
 }
 
 void Parser::exec_LOCATE() {
@@ -1293,4 +1305,36 @@ void Parser::exec_READ() {
         break;
     }
 }
+
+
+// --- RUN immediate command support ---
+// Ensure ON INTERVAL mechanism is reset before each RUN.
+inline void basic_reset_run_event_control(Env& env) {
+    // RUN should start from a clean event/control state.
+    // Reset ON INTERVAL settings so a previous run can't fire during a new run.
+    env.intervalEnabled = false;
+    env.intervalArmed = false;
+    env.inIntervalISR = false;
+    env.intervalSeconds = 0.0;
+    env.intervalGosubLine = 0;
+    env.nextIntervalFire = std::chrono::steady_clock::now();
+
+    // Also clear control stacks for a fresh run.
+    env.forStack.clear();
+    env.gosubStack.clear();
+}
+
+void Parser::exec_BEEP() {
+    // BEEP
+    // Emit a simple bell. On ANSI terminals this is '\a'.
+    // Accept and ignore optional parameters if present.
+    if (tok.kind != TokenKind::End && tok.kind != TokenKind::Colon) {
+        (void)parseExpression();
+        if (accept(TokenKind::Comma)) {
+            (void)parseExpression();
+        }
+    }
+    std::cout << '\a' << std::flush;
+}
+
 

@@ -74,7 +74,7 @@ void get_window_size(int& rows, int& cols) {
     cols = 80;
 }
 
-enum class Key { None, Up, Down, Left, Right, Enter, Backspace, Esc, Char };
+enum class Key { None, Up, Down, Left, Right, Enter, Backspace, Esc, CtrlK, Char };
 
 Key read_key(char& out) {
     char c;
@@ -96,6 +96,9 @@ Key read_key(char& out) {
 
     if (c == 127 || c == 8) return Key::Backspace;
     if (c == '\n' || c == '\r') return Key::Enter;
+
+    // Ctrl+K (VT control code 11)
+    if (c == 11) return Key::CtrlK;
 
     out = c;
     return Key::Char;
@@ -186,6 +189,22 @@ void run_editor(Env& env) {
         if (k == Key::Char && std::isprint((unsigned char)ch)) {
             lines[row].insert(lines[row].begin() + col, ch);
             col++;
+        }
+
+        if (k == Key::CtrlK) {
+            // Delete current line (equivalent to BASIC: DELETE <LineNumber>)
+            if (!lines.empty() && row >= 0 && row < (int)lines.size()) {
+                lines.erase(lines.begin() + row);
+                if (lines.empty()) {
+                    lines.push_back("");
+                    row = 0;
+                    col = 0;
+                } else {
+                    if (row >= (int)lines.size()) row = (int)lines.size() - 1;
+                    if (row < 0) row = 0;
+                    if (col > (int)lines[row].size()) col = (int)lines[row].size();
+                }
+            }
         }
     }
 
