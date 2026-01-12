@@ -12,104 +12,55 @@
 #include <string>
 #include <sstream>
 #include <cctype>
-#include <termios.h>
-#include <unistd.h>
-#include <sys/ioctl.h>
-#include <sys/select.h>
+#include <cmath>
+#include <algorithm>
 #include "env.h"
+#include "SDL.h"
+#include "SDL_ttf.h"
 
-namespace {
-
-struct RawMode {
-    termios orig{};
-    bool active = false;
-
-    void enable() {
-        if (active || !isatty(STDIN_FILENO)) return;
-        tcgetattr(STDIN_FILENO, &orig);
-        termios raw = orig;
-        raw.c_lflag &= ~(ECHO | ICANON | IEXTEN | ISIG);
-        raw.c_iflag &= ~(IXON | ICRNL);
-        raw.c_oflag &= ~(OPOST);
-        raw.c_cc[VMIN] = 0;
-        raw.c_cc[VTIME] = 1;
-        tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw);
-        active = true;
+static TTF_Font* basic_open_mono_font(int pt) {
+    // Try a few common monospace font locations on macOS.
+    const char* candidates[] = {
+        "/System/Library/Fonts/Menlo.ttc",
+        "/System/Library/Fonts/Monaco.ttf",
+        "/Library/Fonts/Menlo.ttc",
+        "/Library/Fonts/Courier New.ttf"
+    };
+    for (const char* p : candidates) {
+        if (!p) continue;
+        TTF_Font* f = TTF_OpenFont(p, pt);
+        if (f) return f;
     }
-
-    void disable() {
-        if (!active) return;
-        tcsetattr(STDIN_FILENO, TCSAFLUSH, &orig);
-        active = false;
-    }
-
-    ~RawMode() { disable(); }
-};
-
-void clear_screen() {
-    std::cout << "\033[2J\033[H";
+    return nullptr;
 }
 
-void move_cursor(int r, int c) {
-    std::cout << "\033[" << r << ";" << c << "H";
+static void sdl_draw_text(SDL_Renderer* r, TTF_Font* font, const std::string& s, int x, int y, SDL_Color c) {
+    if (s.empty()) return;
+    SDL_Surface* surf = TTF_RenderUTF8_Blended(font, s.c_str(), c);
+    if (!surf) return;
+    SDL_Texture* tex = SDL_CreateTextureFromSurface(r, surf);
+    if (!tex) { SDL_FreeSurface(surf); return; }
+    SDL_Rect dst{ x, y, surf->w, surf->h };
+    SDL_RenderCopy(r, tex, nullptr, &dst);
+    SDL_DestroyTexture(tex);
+    SDL_FreeSurface(surf);
 }
 
-bool peek_input(int ms) {
-    fd_set set;
-    FD_ZERO(&set);
-    FD_SET(STDIN_FILENO, &set);
-    timeval tv{ ms / 1000, (ms % 1000) * 1000 };
-    return select(STDIN_FILENO + 1, &set, nullptr, nullptr, &tv) > 0;
-}
+// Run the editor using the *existing* REPL window/renderer/font.
+// The REPL owns `win`, `ren`, and `font` and is responsible for init/teardown.
+void run_editor_inplace(Env& env,
+                        SDL_Window* win,
+                        SDL_Renderer* ren,
+                        TTF_Font* font,
+                        int cols,
+                        int rows,
+                        int cellW,
+                        int cellH,
+                        int insetX,
+                        int insetY) {
+    (void)win; // kept for future use (e.g. title changes)
 
-void get_window_size(int& rows, int& cols) {
-    winsize ws{};
-    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_row > 0 && ws.ws_col > 0) {
-        rows = (int)ws.ws_row;
-        cols = (int)ws.ws_col;
-        return;
-    }
-    // Fallback
-    rows = 24;
-    cols = 80;
-}
-
-enum class Key { None, Up, Down, Left, Right, Enter, Backspace, Esc, CtrlK, Char };
-
-Key read_key(char& out) {
-    char c;
-    if (read(STDIN_FILENO, &c, 1) <= 0) return Key::None;
-
-    if (c == 27) {
-        if (!peek_input(20)) return Key::Esc;
-        char seq[2];
-        if (read(STDIN_FILENO, &seq[0], 1) != 1) return Key::Esc;
-        if (read(STDIN_FILENO, &seq[1], 1) != 1) return Key::Esc;
-        if (seq[0] == '[') {
-            if (seq[1] == 'A') return Key::Up;
-            if (seq[1] == 'B') return Key::Down;
-            if (seq[1] == 'C') return Key::Right;
-            if (seq[1] == 'D') return Key::Left;
-        }
-        return Key::Esc;
-    }
-
-    if (c == 127 || c == 8) return Key::Backspace;
-    if (c == '\n' || c == '\r') return Key::Enter;
-
-    // Ctrl+K (VT control code 11)
-    if (c == 11) return Key::CtrlK;
-
-    out = c;
-    return Key::Char;
-}
-
-} // namespace
-
-void run_editor(Env& env) {
-    RawMode rm;
-    rm.enable();
-
+    // Build editable lines from program.
     std::vector<std::string> lines;
     for (auto& [ln, txt] : env.program) {
         lines.push_back(std::to_string(ln) + " " + txt);
@@ -117,101 +68,131 @@ void run_editor(Env& env) {
     if (lines.empty()) lines.push_back("");
 
     int row = 0, col = 0;
-    int top = 0; // first visible line index (viewport scroll)
-    int termRows = 24, termCols = 80;
+    int top = 0;
 
-    while (true) {
-        get_window_size(termRows, termCols);
-        int visibleRows = std::max(1, termRows); // we use full height; no status bar for now
+    SDL_StartTextInput();
 
-        // Keep viewport aligned so cursor row stays visible.
+    auto clampCursor = [&]() {
+        if (row < 0) row = 0;
+        if (row >= (int)lines.size()) row = (int)lines.size() - 1;
+        if (row < 0) row = 0;
+        int len = (row >= 0 && row < (int)lines.size()) ? (int)lines[row].size() : 0;
+        if (col < 0) col = 0;
+        if (col > len) col = len;
+    };
+
+    bool running = true;
+    while (running) {
+        // Keep viewport aligned.
         if (row < top) top = row;
-        if (row >= top + visibleRows) top = row - visibleRows + 1;
+        if (row >= top + rows) top = row - rows + 1;
         if (top < 0) top = 0;
         if (top > (int)lines.size() - 1) top = std::max(0, (int)lines.size() - 1);
 
-        clear_screen();
+        // Events
+        SDL_Event e;
+        while (SDL_PollEvent(&e)) {
+            if (e.type == SDL_QUIT) {
+                running = false;
+                break;
+            }
+            if (e.type == SDL_KEYDOWN) {
+                SDL_Keycode kc = e.key.keysym.sym;
+                SDL_Keymod mod = (SDL_Keymod)e.key.keysym.mod;
 
-        // Draw visible slice [top, top+visibleRows)
-        for (int screenR = 0; screenR < visibleRows; ++screenR) {
+                if (kc == SDLK_ESCAPE) {
+                    running = false;
+                    break;
+                }
+                if (kc == SDLK_UP) { row--; clampCursor(); }
+                else if (kc == SDLK_DOWN) { row++; clampCursor(); }
+                else if (kc == SDLK_LEFT) { col--; clampCursor(); }
+                else if (kc == SDLK_RIGHT) { col++; clampCursor(); }
+                else if (kc == SDLK_BACKSPACE) {
+                    clampCursor();
+                    if (col > 0 && row >= 0 && row < (int)lines.size()) {
+                        lines[row].erase((size_t)col - 1, 1);
+                        col--;
+                    }
+                }
+                else if (kc == SDLK_RETURN || kc == SDLK_KP_ENTER) {
+                    clampCursor();
+                    if (row >= 0 && row < (int)lines.size()) {
+                        std::string tail = lines[row].substr((size_t)col);
+                        lines[row].erase((size_t)col);
+                        lines.insert(lines.begin() + row + 1, tail);
+                        row++; col = 0;
+                    }
+                }
+                else if ((mod & KMOD_CTRL) && (kc == SDLK_k)) {
+                    // Ctrl+K delete current line
+                    if (!lines.empty() && row >= 0 && row < (int)lines.size()) {
+                        lines.erase(lines.begin() + row);
+                        if (lines.empty()) {
+                            lines.push_back("");
+                            row = 0; col = 0;
+                        } else {
+                            if (row >= (int)lines.size()) row = (int)lines.size() - 1;
+                            if (row < 0) row = 0;
+                            clampCursor();
+                        }
+                    }
+                }
+            }
+            if (e.type == SDL_TEXTINPUT) {
+                clampCursor();
+                if (row >= 0 && row < (int)lines.size()) {
+                    // Insert as UTF-8 bytes (editor is ASCII-ish; keep bytes).
+                    std::string t = e.text.text;
+                    if (!t.empty()) {
+                        lines[row].insert((size_t)col, t);
+                        col += (int)t.size();
+                        clampCursor();
+                    }
+                }
+            }
+        }
+
+        // Render
+        SDL_SetRenderDrawColor(ren, 0, 0, 0, 255);
+        SDL_RenderClear(ren);
+
+        SDL_Color fg{ 220, 220, 220, 255 };
+        SDL_Color dim{ 120, 120, 120, 255 };
+
+        for (int screenR = 0; screenR < rows; ++screenR) {
             int i = top + screenR;
-            move_cursor(screenR + 1, 1);
-            if (i >= 0 && i < (int)lines.size()) {
-                // Clip long lines to terminal width
-                if (termCols > 1 && (int)lines[i].size() > termCols - 1) {
-                    std::cout << lines[i].substr(0, (size_t)termCols - 1);
-                } else {
-                    std::cout << lines[i];
-                }
-            }
+            if (i < 0 || i >= (int)lines.size()) continue;
+
+            std::string s = lines[i];
+            if ((int)s.size() > cols) s.resize((size_t)cols);
+            sdl_draw_text(ren, font, s, insetX, insetY + screenR * cellH, fg);
         }
 
-        // Clamp cursor column to current line length
-        if (row >= 0 && row < (int)lines.size()) {
-            if (col > (int)lines[row].size()) col = (int)lines[row].size();
-            if (col < 0) col = 0;
-        }
+        // Cursor (block outline)
+        clampCursor();
+        int cursorScreenRow = row - top;
+        if (cursorScreenRow < 0) cursorScreenRow = 0;
+        if (cursorScreenRow >= rows) cursorScreenRow = rows - 1;
+        int cursorScreenCol = col;
+        if (cursorScreenCol < 0) cursorScreenCol = 0;
+        if (cursorScreenCol >= cols) cursorScreenCol = cols - 1;
 
-        // Place cursor relative to viewport
-        int cursorScreenRow = (row - top) + 1;
-        if (cursorScreenRow < 1) cursorScreenRow = 1;
-        if (cursorScreenRow > visibleRows) cursorScreenRow = visibleRows;
-        int cursorScreenCol = col + 1;
-        if (cursorScreenCol < 1) cursorScreenCol = 1;
-        if (cursorScreenCol > termCols) cursorScreenCol = termCols;
-        move_cursor(cursorScreenRow, cursorScreenCol);
-        std::cout.flush();
+        SDL_SetRenderDrawColor(ren, 255, 255, 255, 255);
+        SDL_Rect cur{ insetX + cursorScreenCol * cellW, insetY + cursorScreenRow * cellH, cellW, cellH };
+        SDL_RenderDrawRect(ren, &cur);
 
-        char ch = 0;
-        Key k = read_key(ch);
+        // Status line hint (last row overlay)
+        std::string hint = "ESC=exit  CTRL+K=delete line";
+        if ((int)hint.size() > cols) hint.resize((size_t)cols);
+        sdl_draw_text(ren, font, hint, insetX, insetY + (rows - 1) * cellH, dim);
 
-        if (k == Key::Esc) break;
-        if (k == Key::Up && row > 0) { row--; }
-        if (k == Key::Down && row + 1 < (int)lines.size()) { row++; }
-        if (row >= 0 && row < (int)lines.size()) {
-            if (col > (int)lines[row].size()) col = (int)lines[row].size();
-        }
-        if (k == Key::Left && col > 0) col--;
-        if (k == Key::Right && col < (int)lines[row].size()) col++;
-
-        if (k == Key::Backspace && col > 0) {
-            lines[row].erase(col - 1, 1);
-            col--;
-        }
-
-        if (k == Key::Enter) {
-            lines.insert(lines.begin() + row + 1,
-                         lines[row].substr(col));
-            lines[row].erase(col);
-            row++; col = 0;
-        }
-
-        if (k == Key::Char && std::isprint((unsigned char)ch)) {
-            lines[row].insert(lines[row].begin() + col, ch);
-            col++;
-        }
-
-        if (k == Key::CtrlK) {
-            // Delete current line (equivalent to BASIC: DELETE <LineNumber>)
-            if (!lines.empty() && row >= 0 && row < (int)lines.size()) {
-                lines.erase(lines.begin() + row);
-                if (lines.empty()) {
-                    lines.push_back("");
-                    row = 0;
-                    col = 0;
-                } else {
-                    if (row >= (int)lines.size()) row = (int)lines.size() - 1;
-                    if (row < 0) row = 0;
-                    if (col > (int)lines[row].size()) col = (int)lines[row].size();
-                }
-            }
-        }
+        SDL_RenderPresent(ren);
     }
 
-    rm.disable();
-    clear_screen();
+    SDL_StopTextInput();
 
-    // Rebuild program
+    // Rebuild program from edited lines.
     env.program.clear();
     for (auto& l : lines) {
         std::istringstream iss(l);
@@ -219,7 +200,11 @@ void run_editor(Env& env) {
         if (!(iss >> ln)) continue;
         std::string rest;
         std::getline(iss, rest);
-        if (!rest.empty())
-            env.program[ln] = rest.substr(1);
+        if (!rest.empty()) env.program[ln] = rest.substr(1);
     }
+}
+
+void run_editor(Env& env) {
+    (void)env;
+    std::cout << "Editor: in-place SDL editor requires the SDL REPL to call run_editor_inplace(...).\n";
 }

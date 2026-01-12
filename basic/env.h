@@ -20,6 +20,9 @@
 #include <cstring>
 #include <ctime>
 #include <cmath>
+#include <ostream>
+#include <algorithm>
+#include <functional>
 
 struct Parser;
 
@@ -138,6 +141,23 @@ struct Env {
 
     // Console print state (for TAB/PRINT column alignment)
     int printCol = 0; // 0-based column index on the current line
+
+    // Screen driver hooks (SDL console). When set, the interpreter uses these instead
+    // of terminal ANSI escape codes.
+    struct ScreenDriver {
+        // Output a single character (including '\n').
+        std::function<void(char)> putChar;
+        // Clear the screen.
+        std::function<void()> cls;
+        // Move cursor to 1-based (row, col).
+        std::function<void(int /*row*/, int /*col*/)> locate;
+        // Set BASIC colors (0..15). bg may be -1 if not provided.
+        std::function<void(int /*fg*/, int /*bg*/)> color;
+        // Show/hide cursor.
+        std::function<void(bool /*show*/)> showCursor;
+        // Optional beep.
+        std::function<void()> beep;
+    } screen;
 
     // DEFINT: when true for a starting letter, numeric variables default to 16-bit integer.
     // Indexed 0..25 for 'A'..'Z'
@@ -325,6 +345,69 @@ struct Env {
                 break;
         }
     }
+
+    // Debug helper: dump all scalar variables and arrays.
+    // Used by the REPL DEBUG single-step mode.
+    void dumpVars(std::ostream& os) const {
+        auto valueToString = [](const Value& v) -> std::string {
+            if (v.isString()) {
+                const auto& s = std::get<std::string>(v.data);
+                std::string out;
+                out.reserve(s.size() + 2);
+                out.push_back('"');
+                for (char c : s) {
+                    if (c == '"') out.push_back('"'); // GW-BASIC style escaping
+                    out.push_back(c);
+                }
+                out.push_back('"');
+                return out;
+            }
+            if (v.isInt()) {
+                return std::to_string(static_cast<int>(std::get<int16_t>(v.data)));
+            }
+            std::ostringstream oss;
+            oss.setf(std::ios::fmtflags(0), std::ios::floatfield);
+            oss << std::get<double>(v.data);
+            return oss.str();
+        };
+
+        // Scalars
+        os << "  Scalars (" << vars.size() << ")\n";
+        if (!vars.empty()) {
+            std::vector<std::string> names;
+            names.reserve(vars.size());
+            for (const auto& kv : vars) names.push_back(kv.first);
+            std::sort(names.begin(), names.end());
+            for (const auto& name : names) {
+                auto it = vars.find(name);
+                if (it == vars.end()) continue;
+                os << "    " << name << " = " << valueToString(it->second) << "\n";
+            }
+        }
+
+        // Arrays
+        os << "  Arrays (" << arrays.size() << ")\n";
+        if (!arrays.empty()) {
+            std::vector<std::string> anames;
+            anames.reserve(arrays.size());
+            for (const auto& kv : arrays) anames.push_back(kv.first);
+            std::sort(anames.begin(), anames.end());
+
+            for (const auto& an : anames) {
+                auto it = arrays.find(an);
+                if (it == arrays.end()) continue;
+                const Array& a = it->second;
+                int upper = a.elems.empty() ? -1 : static_cast<int>(a.elems.size()) - 1;
+                os << "    " << an << "(0 TO " << upper << ")\n";
+                for (size_t i = 0; i < a.elems.size(); ++i) {
+                    os << "      " << an << "(" << i << ") = " << valueToString(a.elems[i]) << "\n";
+                }
+            }
+        }
+    }
+
+    // Backward-compatible alias if anything calls Env::dump(...)
+    void dump(std::ostream& os) const { dumpVars(os); }
     
     static inline std::string trim_copy(const std::string& s) {
         size_t a = 0, b = s.size();

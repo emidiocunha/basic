@@ -534,7 +534,9 @@ static inline int basic_ansi_bg_code(int c) {
 static constexpr int BASIC_TAB_WIDTH = 14;
 
 static inline void basic_print_char(Env& env, char c) {
-    std::cout << c;
+    if (env.screen.putChar) env.screen.putChar(c);
+    else std::cout << c;
+
     if (c == '\n' || c == '\r') env.printCol = 0;
     else env.printCol++;
 }
@@ -662,12 +664,15 @@ void Parser::exec_INPUT() {
             isArray = true;
         }
 
-        if (!prompt.empty()) std::cout << prompt;
-        else std::cout << "? ";
+        if (!prompt.empty()) basic_print_string(env, prompt);
+        else basic_print_string(env, "? ");
 
         std::string line;
         if (!std::getline(std::cin, line)) line = "";
         line = trim(line);
+        // INPUT is line-oriented; once user submits, BASIC typically continues on the next line.
+        // Keep output consistent for SDL by ending the prompt line.
+        basic_print_char(env, '\n');
 
         Value v;
         if (!name.empty() && name.back() == '$') {
@@ -1026,8 +1031,7 @@ void Parser::execOneStatement() {
             return;
         case TokenKind::KW_CLS:
             tok = lex.next();
-            // ANSI clear screen + cursor home (macOS Terminal/iTerm/VSCode terminal)
-            std::cout << "\033[2J\033[H";
+            if (env.screen.cls) env.screen.cls();
             env.printCol = 0;
             return;
         case TokenKind::KW_LOCATE:
@@ -1093,7 +1097,7 @@ void Parser::parseAndExecLine() {
         }
         break;
     }
-    // Timer safe-point after each statement
+    // Interval safe-point between lines
     maybeFireIntervalInterrupt();
 }
 
@@ -1126,15 +1130,13 @@ void Parser::exec_LOCATE() {
     if (row < 1) row = 1;
     if (col < 1) col = 1;
 
-    // Cursor visibility (ANSI): show = CSI ? 25 h, hide = CSI ? 25 l
     if (cursor == 0) {
-        std::cout << "\033[?25l";
+        if (env.screen.showCursor) env.screen.showCursor(false);
     } else if (cursor == 1) {
-        std::cout << "\033[?25h";
+        if (env.screen.showCursor) env.screen.showCursor(true);
     }
 
-    // ANSI cursor position is 1-based
-    std::cout << "\033[" << row << ";" << col << "H";
+    if (env.screen.locate) env.screen.locate(row, col);
     env.printCol = col - 1;
 }
 
@@ -1158,18 +1160,20 @@ void Parser::exec_COLOR() {
         }
     }
 
-    // Apply ANSI SGR sequences
-    if (fg >= 0) {
-        if (fg < 0) fg = 0;
-        if (fg > 15) fg = 15;
-        std::cout << "\033[" << basic_ansi_fg_code(fg) << "m";
-    }
-
-    if (bg >= 0) {
-        if (bg < 0) bg = 0;
-        if (bg > 15) bg = 15;
-        // Set background for subsequent output only (GW-BASIC-style)
-        std::cout << "\033[" << basic_ansi_bg_code(bg) << "m";
+    // Apply via screen driver (SDL) if present.
+    if (env.screen.color) {
+        // Clamp to GW-BASIC range 0..15 when provided.
+        int cFg = fg;
+        int cBg = bg;
+        if (cFg >= 0) {
+            if (cFg < 0) cFg = 0;
+            if (cFg > 15) cFg = 15;
+        }
+        if (cBg >= 0) {
+            if (cBg < 0) cBg = 0;
+            if (cBg > 15) cBg = 15;
+        }
+        env.screen.color(cFg, cBg);
     }
 }
 
@@ -1334,7 +1338,8 @@ void Parser::exec_BEEP() {
             (void)parseExpression();
         }
     }
-    std::cout << '\a' << std::flush;
+    if (env.screen.beep) env.screen.beep();
+    else std::cout << '\a' << std::flush;
 }
 
 

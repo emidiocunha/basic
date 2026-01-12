@@ -4,6 +4,7 @@
 //
 //  Created by Emidio Cunha on 24/12/2025.
 //
+#define BASIC_USE_SDL 1
 
 #include <iostream>
 #include <fstream>
@@ -32,7 +33,7 @@
 
 int main(int argc, const char * argv[]) {
     Interpreter interp;
-    std::cout << "GW-BASIC-like interpreter. Use RUN, LIST, EDIT, NEW, CLEAR, CONT, DELETE n, SAVE \"file\", LOAD \"file\", and QUIT.\n";
+    //std::cout << "GW-BASIC-like interpreter. Use RUN, LIST, EDIT, NEW, CLEAR, CONT, DELETE n, SAVE \"file\", LOAD \"file\", and QUIT.\n";
 
     // Optional: auto LOAD+RUN a program file passed on the command line.
     // Example: ./basic demo.bas
@@ -44,6 +45,6 @@ int main(int argc, const char * argv[]) {
         }
     }
 
-    interp.repl();
+    interp.repl_sdl2_ttf();
     return EXIT_SUCCESS;
 }
