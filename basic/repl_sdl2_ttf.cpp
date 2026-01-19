@@ -5,14 +5,19 @@
 //  Created by Emídio Cunha on 15/01/2026.
 //
 
-#pragma once
-
 #include <iostream>
 #include <deque>
 #include <vector>
 #include <cstring>
 #include <algorithm>
 #include <cmath>
+#include <thread>
+#include <mutex>
+#include <atomic>
+
+#if defined(__APPLE__)
+#include <pthread.h>
+#endif
 
 #include "SDL.h"
 #include "SDL_ttf.h"
@@ -44,8 +49,14 @@ struct SDLTerminalBuffer {
     SDLTerminalBuffer() { grid.assign((size_t)(cols * rows), Cell{}); }
 
     void clear() {
-        std::fill(grid.begin(), grid.end(), Cell{});
-        curRow = 0; curCol = 0;
+        Cell blank;
+        blank.ch = ' ';
+        blank.fg = curFg;
+        blank.bg = curBg;
+
+        std::fill(grid.begin(), grid.end(), blank);
+        curRow = 0;
+        curCol = 0;
     }
 
     void setColor(int fg, int bg) {
@@ -112,25 +123,38 @@ struct SDLTerminalBuffer {
 
 struct SDLTerminalStreamBuf : public std::streambuf {
     SDLTerminalBuffer* buf = nullptr;
+    std::mutex* mtx = nullptr;
     std::string pending;
 
-    explicit SDLTerminalStreamBuf(SDLTerminalBuffer* b) : buf(b) {}
+    SDLTerminalStreamBuf(SDLTerminalBuffer* b, std::mutex* m) : buf(b), mtx(m) {}
 
     int overflow(int ch) override {
         if (ch == EOF) return EOF;
         char c = (char)ch;
         if (c == '\n') {
-            if (!pending.empty()) { buf->write(pending); pending.clear(); }
+            std::lock_guard<std::mutex> lock(*mtx);
+            if (!pending.empty()) {
+                buf->write(pending);
+                pending.clear();
+            }
             buf->putChar('\n');
         } else {
             pending.push_back(c);
-            if (pending.size() > 4096) { buf->write(pending); pending.clear(); }
+            if (pending.size() > 4096) {
+                std::lock_guard<std::mutex> lock(*mtx);
+                buf->write(pending);
+                pending.clear();
+            }
         }
         return ch;
     }
 
     int sync() override {
-        if (!pending.empty()) { buf->write(pending); pending.clear(); }
+        if (!pending.empty()) {
+            std::lock_guard<std::mutex> lock(*mtx);
+            buf->write(pending);
+            pending.clear();
+        }
         return 0;
     }
 };
@@ -174,6 +198,18 @@ static SDL_Texture* sdl_make_text_texture(SDL_Renderer* r,
 // --- The method moved out of header ---
 void Interpreter::repl_sdl2_ttf() {
     install_basic_sigint_handler_once();
+
+#if defined(__APPLE__)
+    // SDL's Cocoa backend requires event pumping on the main thread.
+    // If this REPL is invoked from a worker thread, Cocoa will raise:
+    // "nextEventMatchingMask should only be called from the Main Thread!"
+    if (pthread_main_np() == 0) {
+        std::cout << "SDL REPL must run on the main thread on macOS. Falling back to console REPL.\n";
+        repl();
+        return;
+    }
+#endif
+
     // Ensure the SDL window is raised/activated on creation (macOS often keeps focus in Terminal).
     SDL_SetHint(SDL_HINT_FORCE_RAISEWINDOW, "1");
 
@@ -190,6 +226,7 @@ void Interpreter::repl_sdl2_ttf() {
         repl();
         return;
     }
+    sdl_ui_active_flag().store(true, std::memory_order_relaxed);
 
     SDL_Window* win = SDL_CreateWindow(
         "GW-BASIC",
@@ -232,69 +269,12 @@ void Interpreter::repl_sdl2_ttf() {
 #endif
     SDL_PumpEvents();
 
-    // Font
-    TTF_Font* font = nullptr;
-    int ptSize = 24;
-    if (!sdl_try_open_font(font, ptSize)) {
-        std::cout << "Could not open a monospace font (Menlo). TTF error: " << TTF_GetError() << "\n";
-        std::cout << "Falling back to console REPL.\n";
-        SDL_DestroyRenderer(renderer);
-        SDL_DestroyWindow(win);
-        TTF_Quit();
-        SDL_Quit();
-        repl();
-        return;
-    }
-
-    // Determine character cell size
-    int charW = 0, charH = 0;
-    {
-        int w = 0, h = 0;
-        SDL_Color fg{255,255,255,255};
-        SDL_Texture* t = sdl_make_text_texture(renderer, font, "M", fg, w, h);
-        if (t) SDL_DestroyTexture(t);
-
-        int minx=0,maxx=0,miny=0,maxy=0,advance=0;
-        if (TTF_GlyphMetrics(font, 'M', &minx,&maxx,&miny,&maxy,&advance) == 0 && advance > 0)
-            charW = advance;
-        else
-            charW = (w > 0 ? w : 10);
-
-        charH = TTF_FontLineSkip(font);
-        if (charH <= 0) charH = (h > 0 ? h : 18);
-    }
-
     // Fixed console geometry: 80x25 characters
     termCols = 80;
     termRows = 25;
 
-    if (charW > 0 && charH > 0) {
-        const int desiredPxW = termCols * charW;
-        const int desiredPxH = termRows * charH;
-
-        int winW=0, winH=0, outW=0, outH=0;
-        SDL_GetWindowSize(win, &winW, &winH);
-        SDL_GetRendererOutputSize(renderer, &outW, &outH);
-
-        float scaleX = (winW > 0) ? ((float)outW / (float)winW) : 1.0f;
-        float scaleY = (winH > 0) ? ((float)outH / (float)winH) : 1.0f;
-        if (scaleX <= 0.0f) scaleX = 1.0f;
-        if (scaleY <= 0.0f) scaleY = 1.0f;
-
-        int desiredWinW = (int)lroundf((float)desiredPxW / scaleX);
-        int desiredWinH = (int)lroundf((float)desiredPxH / scaleY);
-
-        SDL_SetWindowSize(win, desiredWinW + 32, desiredWinH + 32);
-        SDL_SetWindowPosition(win, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
-
-        SDL_RaiseWindow(win);
-#if SDL_VERSION_ATLEAST(2,0,5)
-        (void)SDL_SetWindowInputFocus(win);
-#endif
-        SDL_PumpEvents();
-    }
-
-    int winW_pts=0, winH_pts=0, outW_px=0, outH_px=0;
+    // Determine renderer pixel size (important on HiDPI) and choose padding.
+    int winW_pts = 0, winH_pts = 0, outW_px = 0, outH_px = 0;
     SDL_GetWindowSize(win, &winW_pts, &winH_pts);
     SDL_GetRendererOutputSize(renderer, &outW_px, &outH_px);
 
@@ -303,25 +283,226 @@ void Interpreter::repl_sdl2_ttf() {
     if (padScaleX <= 0.0f) padScaleX = 1.0f;
     if (padScaleY <= 0.0f) padScaleY = 1.0f;
 
-    const int insetX = (int)lroundf(16.0f * padScaleX);
-    const int insetY = (int)lroundf(16.0f * padScaleY);
+    int insetX = (int)lroundf(16.0f * padScaleX);
+    int insetY = (int)lroundf(16.0f * padScaleY);
+
+    // Font: pick the largest point size that still fits 80x25 in the available pixel area.
+    TTF_Font* font = nullptr;
+    int ptSize = 24;
+    int charW = 0, charH = 0;
+
+    auto measure_cell = [&](TTF_Font* f, int& outCharW, int& outCharH) {
+        outCharW = 0;
+        outCharH = 0;
+        if (!f) return;
+
+        int minx=0,maxx=0,miny=0,maxy=0,advance=0;
+        if (TTF_GlyphMetrics(f, 'M', &minx,&maxx,&miny,&maxy,&advance) == 0 && advance > 0) {
+            outCharW = advance;
+        } else {
+            // Fallback if metrics fail: render a single glyph.
+            int w = 0, h = 0;
+            SDL_Color fg{255,255,255,255};
+            SDL_Texture* t = sdl_make_text_texture(renderer, f, "M", fg, w, h);
+            if (t) SDL_DestroyTexture(t);
+            outCharW = (w > 0 ? w : 10);
+            outCharH = (h > 0 ? h : 18);
+        }
+
+        int ls = TTF_FontLineSkip(f);
+        outCharH = (ls > 0) ? ls : (outCharH > 0 ? outCharH : 18);
+        if (outCharW <= 0) outCharW = 10;
+        if (outCharH <= 0) outCharH = 18;
+    };
+
+    auto open_best_font = [&]() -> bool {
+        const int availW = std::max(0, outW_px - insetX * 2);
+        const int availH = std::max(0, outH_px - insetY * 2);
+
+        // Search a reasonable point-size range.
+        int bestPt = -1;
+        int bestCW = 0;
+        int bestCH = 0;
+        TTF_Font* bestFont = nullptr;
+
+        // Start from small to large so we end on the biggest that fits.
+        for (int candidate = 8; candidate <= 96; ++candidate) {
+            TTF_Font* f = nullptr;
+            if (!sdl_try_open_font(f, candidate)) {
+                // If we can't open at this size, try next.
+                continue;
+            }
+
+            int cw = 0, ch = 0;
+            measure_cell(f, cw, ch);
+
+            const int needW = termCols * cw;
+            const int needH = termRows * ch;
+
+            if (needW <= availW && needH <= availH) {
+                // Candidate fits, keep it.
+                if (bestFont) TTF_CloseFont(bestFont);
+                bestFont = f;
+                bestPt = candidate;
+                bestCW = cw;
+                bestCH = ch;
+            } else {
+                // Doesn't fit, discard.
+                TTF_CloseFont(f);
+            }
+        }
+
+        if (!bestFont) return false;
+
+        font = bestFont;
+        ptSize = bestPt;
+        charW = bestCW;
+        charH = bestCH;
+        return true;
+    };
+
+    // --- Fullscreen/windowed helpers ---
+
+    auto open_fixed_font = [&](int fixedPt) -> bool {
+        if (font) { TTF_CloseFont(font); font = nullptr; }
+        if (!sdl_try_open_font(font, fixedPt)) return false;
+        ptSize = fixedPt;
+        measure_cell(font, charW, charH);
+        return true;
+    };
+
+    auto recompute_insets = [&]() {
+        SDL_GetWindowSize(win, &winW_pts, &winH_pts);
+        SDL_GetRendererOutputSize(renderer, &outW_px, &outH_px);
+
+        padScaleX = (winW_pts > 0) ? ((float)outW_px / (float)winW_pts) : 1.0f;
+        padScaleY = (winH_pts > 0) ? ((float)outH_px / (float)winH_pts) : 1.0f;
+        if (padScaleX <= 0.0f) padScaleX = 1.0f;
+        if (padScaleY <= 0.0f) padScaleY = 1.0f;
+
+        insetX = (int)lroundf(16.0f * padScaleX);
+        insetY = (int)lroundf(16.0f * padScaleY);
+    };
+
+    auto size_window_for_80x25 = [&]() {
+        // Size the *window points* so the *renderer output pixels* have enough room for 80x25 + insets.
+        SDL_GetWindowSize(win, &winW_pts, &winH_pts);
+        SDL_GetRendererOutputSize(renderer, &outW_px, &outH_px);
+
+        float scaleX = (winW_pts > 0) ? ((float)outW_px / (float)winW_pts) : 1.0f;
+        float scaleY = (winH_pts > 0) ? ((float)outH_px / (float)winH_pts) : 1.0f;
+        if (scaleX <= 0.0f) scaleX = 1.0f;
+        if (scaleY <= 0.0f) scaleY = 1.0f;
+
+        // Insets in output pixels.
+        int insetPxX = (int)lroundf(16.0f * scaleX);
+        int insetPxY = (int)lroundf(16.0f * scaleY);
+
+        const int desiredOutW = insetPxX * 2 + termCols * charW;
+        const int desiredOutH = insetPxY * 2 + termRows * charH;
+
+        int desiredWinW = (int)lroundf((float)desiredOutW / scaleX);
+        int desiredWinH = (int)lroundf((float)desiredOutH / scaleY);
+
+        SDL_SetWindowSize(win, desiredWinW, desiredWinH);
+        SDL_SetWindowPosition(win, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
+
+        // Recompute insets based on final sizes.
+        recompute_insets();
+    };
+
+    bool isFullscreen = true;
+    bool applyingDisplayMode = false;
+
+    auto apply_display_mode = [&](bool fullscreen) -> bool {
+        if (applyingDisplayMode) return true;
+        applyingDisplayMode = true;
+        isFullscreen = fullscreen;
+
+        if (fullscreen) {
+            if (SDL_SetWindowFullscreen(win, SDL_WINDOW_FULLSCREEN_DESKTOP) != 0) {
+                std::cout << "SDL_SetWindowFullscreen failed: " << SDL_GetError() << "\n";
+                applyingDisplayMode = false;
+                return false;
+            }
+            recompute_insets();
+
+            // Re-pick the best font size for the current fullscreen output.
+            if (!open_best_font()) {
+                applyingDisplayMode = false;
+                return false;
+            }
+            // Insets depend on output/window scale; recompute after any changes.
+            recompute_insets();
+            applyingDisplayMode = false;
+            return true;
+        }
+
+        // Windowed mode: fixed 18pt font and window sized for exactly 80x25.
+        if (SDL_SetWindowFullscreen(win, 0) != 0) {
+            std::cout << "SDL_SetWindowFullscreen(off) failed: " << SDL_GetError() << "\n";
+            applyingDisplayMode = false;
+            return false;
+        }
+        if (!open_fixed_font(18)) {
+            std::cout << "Could not open a monospace font at 18pt. TTF error: " << TTF_GetError() << "\n";
+            applyingDisplayMode = false;
+            return false;
+        }
+
+        // First recompute insets, then size window appropriately.
+        recompute_insets();
+        size_window_for_80x25();
+        applyingDisplayMode = false;
+        return true;
+    };
+
+    if (!open_best_font()) {
+        // Fall back to a fixed size if the search failed.
+        if (!sdl_try_open_font(font, ptSize)) {
+            std::cout << "Could not open a monospace font (Menlo). TTF error: " << TTF_GetError() << "\n";
+            std::cout << "Falling back to console REPL.\n";
+            SDL_DestroyRenderer(renderer);
+            SDL_DestroyWindow(win);
+            TTF_Quit();
+            SDL_Quit();
+            repl();
+            return;
+        }
+        measure_cell(font, charW, charH);
+    }
+
+    // Start in fullscreen mode by default.
+    if (!apply_display_mode(true)) {
+        std::cout << "Failed to apply initial display mode. Falling back to console REPL.\n";
+        SDL_DestroyRenderer(renderer);
+        SDL_DestroyWindow(win);
+        TTF_Quit();
+        SDL_Quit();
+        repl();
+        return;
+    }
+
 
     SDLTerminalBuffer term;
     term.pushLine("GW-BASIC-like interpreter. Use RUN, LIST, EDIT, NEW, CLEAR, CONT, DELETE n, SAVE \"file\", LOAD \"file\", and QUIT.");
 
-    // Wire BASIC screen driver to the SDL terminal buffer
-    env.screen.putChar = [&](char c) { term.putChar(c); };
-    env.screen.cls = [&]() { term.clear(); };
-    env.screen.locate = [&](int row, int col) { term.locate1(row, col); };
-    env.screen.showCursor = [&](bool show) { term.showCursor(show); };
+    std::mutex termMutex;
+
+    // Wire BASIC screen driver to the SDL terminal buffer, locking for thread safety
+    env.screen.putChar = [&](char c) { std::lock_guard<std::mutex> lock(termMutex); term.putChar(c); };
+    env.screen.cls = [&]() { std::lock_guard<std::mutex> lock(termMutex); term.clear(); };
+    env.screen.locate = [&](int row, int col) { std::lock_guard<std::mutex> lock(termMutex); term.locate1(row, col); };
+    env.screen.showCursor = [&](bool show) { std::lock_guard<std::mutex> lock(termMutex); term.showCursor(show); };
     env.screen.color = [&](int fg, int bg) {
+        std::lock_guard<std::mutex> lock(termMutex);
         int useFg = (fg < 0) ? term.curFg : fg;
         int useBg = (bg < 0) ? term.curBg : bg;
         term.setColor(useFg, useBg);
     };
     env.screen.beep = [&]() { };
 
-    SDLTerminalStreamBuf sb(&term);
+    SDLTerminalStreamBuf sb(&term, &termMutex);
     std::streambuf* oldCout = std::cout.rdbuf(&sb);
 
     // REPL input state
@@ -334,6 +515,12 @@ void Interpreter::repl_sdl2_ttf() {
     int inputAnchorRow = term.curRow;
     int inputAnchorCol = term.curCol;
 
+    // Program INPUT capture (while a BASIC program is waiting for INPUT)
+    std::string programInput;
+    int programInputAnchorRow = 0;
+    int programInputAnchorCol = 0;
+    bool programInputActive = false;
+
     auto putAt0 = [&](int r, int c, char ch) {
         if (r < 0 || c < 0 || r >= term.rows || c >= term.cols) return;
         auto& cell = term.grid[(size_t)(r * term.cols + c)];
@@ -343,6 +530,7 @@ void Interpreter::repl_sdl2_ttf() {
     };
 
     auto beginPrompt = [&]() {
+        std::lock_guard<std::mutex> lock(termMutex);
         term.setColor(15, 0);
         term.write("OK> ");
         inputAnchorRow = term.curRow;
@@ -374,6 +562,7 @@ void Interpreter::repl_sdl2_ttf() {
     };
 
     auto redrawInput = [&](const std::string& newLine) {
+        std::lock_guard<std::mutex> lock(termMutex);
         eraseCurrentInput();
         line = newLine;
         int pos0 = inputAnchorCol;
@@ -387,18 +576,66 @@ void Interpreter::repl_sdl2_ttf() {
         moveCursorToInputEnd();
     };
 
+    auto beginProgramInput = [&]() {
+        std::lock_guard<std::mutex> lock(termMutex);
+        programInputActive = true;
+        programInput.clear();
+        programInputAnchorRow = term.curRow;
+        programInputAnchorCol = term.curCol;
+    };
+
+    auto eraseProgramInput = [&]() {
+        int pos0 = programInputAnchorCol;
+        int len = (int)programInput.size();
+        for (int i = 0; i < len; ++i) {
+            int pos = pos0 + i;
+            int r = programInputAnchorRow + (pos / term.cols);
+            int c = (pos % term.cols);
+            if (r >= term.rows) break;
+            putAt0(r, c, ' ');
+        }
+    };
+
+    auto redrawProgramInput = [&](const std::string& newLine) {
+        std::lock_guard<std::mutex> lock(termMutex);
+        eraseProgramInput();
+        programInput = newLine;
+        int pos0 = programInputAnchorCol;
+        for (size_t i = 0; i < programInput.size(); ++i) {
+            int pos = pos0 + (int)i;
+            int r = programInputAnchorRow + (pos / term.cols);
+            int c = (pos % term.cols);
+            if (r >= term.rows) break;
+            putAt0(r, c, programInput[i]);
+        }
+        // Move cursor to end
+        int pos = programInputAnchorCol + (int)programInput.size();
+        int r = programInputAnchorRow + (pos / term.cols);
+        int c = (pos % term.cols);
+        if (r >= term.rows) r = term.rows - 1;
+        term.curRow = r;
+        term.curCol = c;
+    };
+
     bool running = true;
 
     bool programRunning = false;
     bool sdlDebugPaused = false;
     bool sdlDebugNeedPrint = false;
+    std::thread programThread;
+    std::atomic<bool> programDone{false};
 
     auto finishProgramRun = [&]() {
         programRunning = false;
         sdlDebugPaused = false;
         sdlDebugNeedPrint = false;
         debugStepping = false;
-        term.putChar('\n');
+        programInputActive = false;
+        programInput.clear();
+        {
+            std::lock_guard<std::mutex> lock(termMutex);
+            term.putChar('\n');
+        }
         beginPrompt();
     };
 
@@ -491,7 +728,10 @@ void Interpreter::repl_sdl2_ttf() {
         std::string t = trim(raw);
 
         moveCursorToInputEnd();
-        term.putChar('\n');
+        {
+            std::lock_guard<std::mutex> lock(termMutex);
+            term.putChar('\n');
+        }
 
         if (t.empty()) { beginPrompt(); return; }
 
@@ -517,7 +757,18 @@ void Interpreter::repl_sdl2_ttf() {
         upper.reserve(t.size());
         for (char c : t) upper.push_back((char)std::toupper((unsigned char)c));
 
-        if (upper == "RUN") { startRun(); programRunning = true; return; }
+        if (upper == "RUN") {
+            startRun();
+            debugStepping = false;
+            programDone.store(false, std::memory_order_relaxed);
+            programRunning = true;
+            if (programThread.joinable()) programThread.join();
+            programThread = std::thread([&]() {
+                this->execute();
+                programDone.store(true, std::memory_order_relaxed);
+            });
+            return;
+        }
 
         if (upper == "DEBUG") {
             startRun();
@@ -534,8 +785,18 @@ void Interpreter::repl_sdl2_ttf() {
 
         if (upper == "CONT") {
             startCont();
-            if (env.running) programRunning = true;
-            else beginPrompt();
+            if (env.running) {
+                debugStepping = false;
+                programDone.store(false, std::memory_order_relaxed);
+                programRunning = true;
+                if (programThread.joinable()) programThread.join();
+                programThread = std::thread([&]() {
+                    this->execute();
+                    programDone.store(true, std::memory_order_relaxed);
+                });
+            } else {
+                beginPrompt();
+            }
             return;
         }
 
@@ -572,7 +833,18 @@ void Interpreter::repl_sdl2_ttf() {
             }
 
             cmd_LOAD(fn);
-            if (runAfterLoad) { startRun(); programRunning = true; return; }
+            if (runAfterLoad) {
+                startRun();
+                debugStepping = false;
+                programDone.store(false, std::memory_order_relaxed);
+                programRunning = true;
+                if (programThread.joinable()) programThread.join();
+                programThread = std::thread([&]() {
+                    this->execute();
+                    programDone.store(true, std::memory_order_relaxed);
+                });
+                return;
+            }
             beginPrompt();
             return;
         }
@@ -621,13 +893,54 @@ void Interpreter::repl_sdl2_ttf() {
         SDL_Event e;
         while (SDL_PollEvent(&e)) {
             if (e.type == SDL_QUIT) { running = false; break; }
-            if (e.type == SDL_WINDOWEVENT && e.window.event == SDL_WINDOWEVENT_SIZE_CHANGED) { continue; }
+            if (e.type == SDL_WINDOWEVENT) {
+                if (applyingDisplayMode) continue;
+
+                // If the user toggles fullscreen via the title-bar green button,
+                // SDL will update window flags; sync our mode and re-fit fonts/sizing.
+                if (e.window.event == SDL_WINDOWEVENT_SIZE_CHANGED ||
+                    e.window.event == SDL_WINDOWEVENT_MAXIMIZED ||
+                    e.window.event == SDL_WINDOWEVENT_RESTORED) {
+
+                    const Uint32 flags = SDL_GetWindowFlags(win);
+                    const bool nowFullscreen = (flags & SDL_WINDOW_FULLSCREEN) || (flags & SDL_WINDOW_FULLSCREEN_DESKTOP);
+
+                    if (nowFullscreen != isFullscreen) {
+                        (void)apply_display_mode(nowFullscreen);
+                    } else if (!isFullscreen) {
+                        // Windowed mode is fixed to 80x25; if the OS resized the window (zoom button), snap back.
+                        size_window_for_80x25();
+                    } else {
+                        // Fullscreen: recompute insets to keep rendering aligned.
+                        recompute_insets();
+                    }
+                }
+                continue;
+            }
 
             if (e.type == SDL_TEXTINPUT) {
-                if (programRunning) continue;
+                if (programRunning) {
+                    if (!sdl_waiting_input_flag().load(std::memory_order_relaxed)) continue;
+                    if (!programInputActive) beginProgramInput();
+                    const char* t = e.text.text;
+                    if (t) {
+                        std::lock_guard<std::mutex> lock(termMutex);
+                        for (const char* p = t; *p; ++p) {
+                            programInput.push_back(*p);
+                            term.putChar(*p);
+                        }
+                    }
+                    continue;
+                }
                 if (historyNav) { historyNav = false; historyIndex = -1; }
                 const char* t = e.text.text;
-                if (t) for (const char* p = t; *p; ++p) { line.push_back(*p); term.putChar(*p); }
+                if (t) {
+                    std::lock_guard<std::mutex> lock(termMutex);
+                    for (const char* p = t; *p; ++p) {
+                        line.push_back(*p);
+                        term.putChar(*p);
+                    }
+                }
                 continue;
             }
 
@@ -636,20 +949,61 @@ void Interpreter::repl_sdl2_ttf() {
                 SDL_Keymod mod = (SDL_Keymod)e.key.keysym.mod;
 
                 if (programRunning) {
+                    // If BASIC is waiting for INPUT, capture typing and deliver it to the worker thread.
+                    if (sdl_waiting_input_flag().load(std::memory_order_relaxed)) {
+                        if (!programInputActive) beginProgramInput();
+
+                        if (sym == SDLK_BACKSPACE) {
+                            if (!programInput.empty()) {
+                                std::string nl = programInput;
+                                nl.pop_back();
+                                redrawProgramInput(nl);
+                            }
+                            continue;
+                        }
+
+                        if (sym == SDLK_RETURN || sym == SDLK_KP_ENTER) {
+                            sdl_post_input_line(programInput);
+                            programInputActive = false;
+                            {
+                                std::lock_guard<std::mutex> lock(termMutex);
+                                term.putChar('\n');
+                            }
+                            continue;
+                        }
+                    }
+
+                    // Debug stepping keys
                     if (debugStepping) {
                         if (sym == SDLK_SPACE) sdlDebugPaused = false;
                         else if (sym == SDLK_ESCAPE) { env.running=false; env.stopped=false; env.contAvailable=false; finishProgramRun(); }
                         continue;
                     }
+
                     if (sym == SDLK_ESCAPE) g_sigint_requested.store(true, std::memory_order_relaxed);
                     continue;
                 }
 
                 if (sym == SDLK_ESCAPE) { running = false; break; }
 
+                // Toggle fullscreen/windowed.
+                // Note: on macOS F11 is often captured by the system (Show Desktop), so provide alternatives.
+                const bool toggleFullscreen =
+                    (sym == SDLK_F11) ||
+                    ((mod & KMOD_GUI) && (sym == SDLK_f)) ||
+                    ((mod & KMOD_ALT) && (sym == SDLK_RETURN || sym == SDLK_KP_ENTER));
+
+                if (toggleFullscreen) {
+                    if (!apply_display_mode(!isFullscreen)) {
+                        std::cout << "Display mode toggle failed.\n";
+                    }
+                    continue;
+                }
+
                 if (sym == SDLK_F5) { redrawInput("RUN"); commitLine("RUN"); continue; }
 
                 if ((mod & KMOD_CTRL) && (sym == SDLK_l)) {
+                    std::lock_guard<std::mutex> lock(termMutex);
                     term.clear();
                     term.pushLine("(cleared)");
                     beginPrompt();
@@ -683,14 +1037,18 @@ void Interpreter::repl_sdl2_ttf() {
             }
         }
 
-        if (programRunning) {
+        // If a background run finished, join and return to prompt.
+        if (programRunning && !debugStepping && programDone.load(std::memory_order_relaxed)) {
+            if (programThread.joinable()) programThread.join();
+            finishProgramRun();
+        }
+
+        // DEBUG still runs step-by-step on the UI thread.
+        if (programRunning && debugStepping) {
             for (int i = 0; i < 200 && programRunning; ++i) executeStep();
         }
 
         // Render
-        SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
-        SDL_RenderClear(renderer);
-
         auto basicPalette = [&](uint8_t idx) -> SDL_Color {
             static const SDL_Color pal[16] = {
                 {0,0,0,255},{0,0,170,255},{0,170,0,255},{0,170,170,255},
@@ -701,8 +1059,18 @@ void Interpreter::repl_sdl2_ttf() {
             return pal[idx & 15];
         };
 
+        // Clear with actual background (COLOR bg)
+        {
+            std::lock_guard<std::mutex> lock(termMutex);
+            SDL_Color bgc = basicPalette(term.curBg);
+            SDL_SetRenderDrawColor(renderer, bgc.r, bgc.g, bgc.b, 255);
+            SDL_RenderClear(renderer);
+        }
+
         const int cellW = charW;
         const int cellH = charH;
+
+        std::lock_guard<std::mutex> lock(termMutex);
 
         for (int r = 0; r < term.rows; ++r) {
             int c = 0;
@@ -753,14 +1121,21 @@ void Interpreter::repl_sdl2_ttf() {
         SDL_RenderPresent(renderer);
     }
 
+    if (programThread.joinable()) {
+        // Request stop and wait.
+        g_sigint_requested.store(true, std::memory_order_relaxed);
+        programThread.join();
+    }
+
     SDL_StopTextInput();
 
     env.screen = {};
     std::cout.rdbuf(oldCout);
-
+    sdl_ui_active_flag().store(false, std::memory_order_relaxed);
     TTF_CloseFont(font);
     SDL_DestroyRenderer(renderer);
     SDL_DestroyWindow(win);
     TTF_Quit();
     SDL_Quit();
 }
+

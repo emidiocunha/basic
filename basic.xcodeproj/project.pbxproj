@@ -6,18 +6,6 @@
 	objectVersion = 77;
 	objects = {
 
-/* Begin PBXCopyFilesBuildPhase section */
-		B8E0FD172EFC5C78005ADC98 /* CopyFiles */ = {
-			isa = PBXCopyFilesBuildPhase;
-			buildActionMask = 2147483647;
-			dstPath = /usr/share/man/man1/;
-			dstSubfolderSpec = 0;
-			files = (
-			);
-			runOnlyForDeploymentPostprocessing = 1;
-		};
-/* End PBXCopyFilesBuildPhase section */
-
 /* Begin PBXFileReference section */
 		B84A14AF2F1185E40018A4CB /* libSDL2_ttf-2.0.0.dylib */ = {isa = PBXFileReference; lastKnownFileType = "compiled.mach-o.dylib"; name = "libSDL2_ttf-2.0.0.dylib"; path = "../../../../../opt/homebrew/Cellar/sdl2_ttf/2.24.0/lib/libSDL2_ttf-2.0.0.dylib"; sourceTree = "<group>"; };
 		B84A14B32F1186200018A4CB /* begin_code.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = begin_code.h; sourceTree = "<group>"; };
@@ -243,7 +231,6 @@
 			buildPhases = (
 				B8E0FD152EFC5C78005ADC98 /* Sources */,
 				B8E0FD162EFC5C78005ADC98 /* Frameworks */,
-				B8E0FD172EFC5C78005ADC98 /* CopyFiles */,
 			);
 			buildRules = (
 			);
@@ -423,6 +410,7 @@
 		B8E0FD212EFC5C78005ADC98 /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
+				"CODE_SIGN_IDENTITY[sdk=macosx*]" = "-";
 				CODE_SIGN_STYLE = Automatic;
 				DEVELOPMENT_TEAM = 678732K22X;
 				ENABLE_HARDENED_RUNTIME = NO;
@@ -431,6 +419,7 @@
 					"DEBUG=1",
 				);
 				"LIBRARY_SEARCH_PATHS[arch=*]" = "/opt/homebrew/lib/**";
+				MACOSX_DEPLOYMENT_TARGET = 15.6;
 				OTHER_LDFLAGS = (
 					"-lSDL2",
 					"-lSDL2_ttf",
@@ -442,10 +431,12 @@
 		B8E0FD222EFC5C78005ADC98 /* Release */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
+				"CODE_SIGN_IDENTITY[sdk=macosx*]" = "-";
 				CODE_SIGN_STYLE = Automatic;
 				DEVELOPMENT_TEAM = 678732K22X;
 				ENABLE_HARDENED_RUNTIME = NO;
 				GCC_PREPROCESSOR_DEFINITIONS = "BASIC_USE_SDL=1";
+				MACOSX_DEPLOYMENT_TARGET = 15.6;
 				OTHER_LDFLAGS = (
 					"-lSDL2",
 					"-lSDL2_ttf",

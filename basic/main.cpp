@@ -23,12 +23,7 @@
 #include <limits>
 #include <algorithm>
 #include <filesystem>
-#include "token.h"
-#include "env.h"
-#include "editor.h"
-#include "string.h"
-#include "lexer.h"
-#include "parser.h"
+
 #include "interpreter.h"
 
 int main(int argc, const char * argv[]) {
