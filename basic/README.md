@@ -19,7 +19,7 @@ It is designed to run in a modern terminal while preserving the *look & feel* an
 - FOR / NEXT (supports nested loops)
 - DIM (1D arrays, implicit DIM 0..10)
 - READ / DATA / RESTORE
-- DEFINT (accepted and ignored, for compatibility)
+- DEFINT
 - REM comments
 
 ### ✅ Built-in Functions
@@ -46,6 +46,7 @@ It is designed to run in a modern terminal while preserving the *look & feel* an
 
 ### 🖥️ Screen & Terminal
 - `PRINT` with `,` and `;`
+- `INPUT`
 - `CLS`
 - `LOCATE row, col [, cursor]`
   - cursor: `0 = hide`, `1 = show`
@@ -54,7 +55,6 @@ It is designed to run in a modern terminal while preserving the *look & feel* an
 
 ### 🧾 Program Editing
 - Built-in line editor
-- Scrolls correctly when program exceeds screen height
 - Handles insertion, deletion, navigation
 
 ### ⌨️ REPL
@@ -62,8 +62,7 @@ It is designed to run in a modern terminal while preserving the *look & feel* an
 - `RUN`, `LIST`, `NEW`, `CLEAR`, `CONT`
 - `QUIT` / `EXIT`
 - **Ctrl+C** stops a running program (returns to REPL)
-- **UP arrow recalls last command** (in real terminals)
-- Graceful fallback in non-TTY environments (e.g. Xcode console)
+- **UP arrow recalls last command**
 
 ---
 
